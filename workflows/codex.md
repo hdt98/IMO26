@@ -20,16 +20,17 @@ configured model endpoint. It reads credentials from environment variables:
 - IMO_SOLVER_TOKEN - bearer token
 - IMO_SOLVER_MODEL - model name
 
-Default endpoint: http://165.245.166.41:30000/v1/chat/completions
-Default model: GLM-5.2-FP8
+Two endpoints are available. Choose one and use its matching token:
 
-The orchestrator.py script already encodes these defaults. You only need to
-set IMO_SOLVER_TOKEN (the bearer token). The token is in ~/.claude/settings.json
-under env ANTHROPIC_AUTH_TOKEN.
+  Cloud endpoint (from Codex config):
+    - API URL: ~/.codex/config.toml [model_providers.custom] base_url + /chat/completions
+    - Token: ~/.codex/auth.json key "OPENAI_API_KEY"
+    - Model: ~/.codex/config.toml top-level "model"
 
-WARNING: Do NOT use ANTHROPIC_BASE_URL from ~/.claude/settings.json as the
-API URL. That Nexus cloud URL (my-tenant-2-glm52-sonle-tp4.onenexus-do.cloud)
-is frequently unreachable. Always use the IP endpoint above.
+  Direct IP endpoint:
+    - API URL: http://165.245.166.41:30000/v1/chat/completions
+    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
+    - Model: GLM-5.2-FP8
 
 Never print or persist the token. Extract it at runtime without exposing values.
 
@@ -44,7 +45,16 @@ with finish_reason=stop. The orchestrator script already encodes these defaults.
 Launch the orchestrator inside a detached screen session so it survives
 exec_command yielding:
 
-    screen -dmS imo_solver bash -c       'cd <run-dir> &&        IMO_SOLVER_TOKEN=<token>        IMO_SOLVER_API_URL=http://165.245.166.41:30000/v1/chat/completions        IMO_SOLVER_MODEL=GLM-5.2-FP8        python3 orchestrator.py          --problem <repo>/problems/<problem-file>          --run-dir <run-dir>          --output <repo>/solutions/<problem-id>.md          > stdout.log 2> stderr.log'
+    screen -dmS imo_solver bash -c \
+      'cd <run-dir> && \
+       IMO_SOLVER_TOKEN=<token> \
+       IMO_SOLVER_API_URL=<endpoint> \
+       IMO_SOLVER_MODEL=<model> \
+       python3 orchestrator.py \
+         --problem <repo>/problems/<problem-file> \
+         --run-dir <run-dir> \
+         --output <repo>/solutions/<problem-id>.md \
+         > stdout.log 2> stderr.log'
 
 ## First check after launch
 
@@ -57,7 +67,7 @@ anything else:
 If progress.log shows any ERROR line, the orchestrator is failing. Common
 causes:
   - Connection timeout to the API endpoint: wrong URL or endpoint is down
-  - 401 Unauthorized: wrong token
+  - 401 Unauthorized: wrong token for the chosen endpoint
   - 422 Unprocessable Entity: model name not recognized
 
 Do NOT keep waiting if you see errors. Diagnose and fix the issue, then
@@ -78,7 +88,8 @@ Instead, use one of these patterns:
 
 Create a monitor screen session that writes progress to a file:
 
-    screen -dmS monitor bash -c       'while true; do tail -1 <run-dir>/progress.log > <run-dir>/monitor_latest.txt 2>/dev/null; sleep 600; done'
+    screen -dmS monitor bash -c \
+      'while true; do tail -1 <run-dir>/progress.log > <run-dir>/monitor_latest.txt 2>/dev/null; sleep 600; done'
 
 Then check periodically (every 10-15 minutes):
 

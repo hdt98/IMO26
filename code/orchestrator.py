@@ -16,8 +16,7 @@ Usage:
         --output solutions/imo2026_p1.md
 
 Environment fallbacks: IMO_SOLVER_API_URL, IMO_SOLVER_TOKEN, IMO_SOLVER_MODEL
-Defaults: API_URL=http://165.245.166.41:30000/v1/chat/completions, MODEL=GLM-5.2-FP8
-Only IMO_SOLVER_TOKEN is required (no default).
+
 """
 
 import argparse
@@ -379,20 +378,25 @@ def main():
     )
     parser.add_argument("--problem", type=Path, required=True)
     parser.add_argument(
-        "--api-url", default=os.getenv("IMO_SOLVER_API_URL", "http://165.245.166.41:30000/v1/chat/completions")
+        "--api-url", default=os.getenv("IMO_SOLVER_API_URL", "")
     )
     parser.add_argument(
         "--api-key", default=os.getenv("IMO_SOLVER_TOKEN", "")
     )
     parser.add_argument(
-        "--model", default=os.getenv("IMO_SOLVER_MODEL", "GLM-5.2-FP8")
+        "--model", default=os.getenv("IMO_SOLVER_MODEL", "")
     )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    if not args.api_url:
+        parser.error("--api-url or IMO_SOLVER_API_URL is required")
     if not args.api_key:
         parser.error("--api-key or IMO_SOLVER_TOKEN is required")
+    if not args.model:
+        parser.error("--model or IMO_SOLVER_MODEL is required")
+
     problem = args.problem.read_text(encoding="utf-8")
     args.run_dir.mkdir(parents=True, exist_ok=True)
 

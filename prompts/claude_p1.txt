@@ -8,17 +8,38 @@ Authoritative problem file: problems/imo2026_p1.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
+Credentials — choose one endpoint and its matching token:
+  Cloud endpoint (from Claude settings):
+    - API URL: ~/.claude/settings.json env "ANTHROPIC_BASE_URL"
+      + /chat/completions
+    - Token: ~/.claude/settings.json env "ANTHROPIC_AUTH_TOKEN"
+    - Model: ~/.claude/settings.json env "ANTHROPIC_MODEL"
+  Direct IP endpoint:
+    - API URL: http://165.245.166.41:30000/v1/chat/completions
+    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
+    - Model: GLM-5.2-FP8
+Never print or persist the token value.
+
 Begin executing immediately after reading the contract. You have a hard budget
 of 4 consecutive responses before the turn is aborted - every response must
 include at least one tool call. Break work into small phases and act on each
 one; do not spend multiple responses on extended thinking alone, or the session
 will terminate the turn.
 
-This must be a fresh, independent run. Do not read prior solutions, run logs,
-verification reports, scratch work, or artifacts. The Desktop parent is an
-orchestrator only and may not solve or grade the mathematics. Keep the Goal
-active until the background workflow either persists a candidate that earns
-five consecutive independent passes or records a legitimate terminal failure.
+After launching the orchestrator, wait 30 seconds then check these files
+in the run directory:
+  1. cat <run-dir>/progress.log — one line per state transition or error
+  2. tail <run-dir>/stderr.log — API call failures and tracebacks
+If progress.log shows any ERROR line, the run is failing. Do not keep
+waiting; diagnose the error and fix it before retrying. Do NOT poll for
+sentinel files — the orchestrator never creates them.
+
+This must be a fresh, independent run. Do not read prior solutions, run
+logs, verification reports, scratch work, or artifacts. The Desktop parent
+is an orchestrator only and may not solve or grade the mathematics. Keep
+the Goal active until the background workflow either persists a candidate
+that earns five consecutive independent passes or records a legitimate
+terminal failure.
 
 Do not interpret a UI wait timeout as a stream failure, do not silently
 duplicate active requests, and do not lower the acceptance threshold.

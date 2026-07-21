@@ -21,10 +21,19 @@ or command-line flags:
 - --api-key (or IMO_SOLVER_TOKEN)  - bearer token
 - --model   (or IMO_SOLVER_MODEL)  - model name
 
-If credentials live in ~/.claude/settings.json under env (e.g.
-ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL), derive the
-OpenAI-compatible endpoint by appending /v1/chat/completions to the base URL
-and pass the same token. Never print or persist the token in source files.
+Two endpoints are available. Choose one and use its matching token:
+
+  Cloud endpoint (from Claude settings):
+    - API URL: ~/.claude/settings.json env "ANTHROPIC_BASE_URL" + /chat/completions
+    - Token: ~/.claude/settings.json env "ANTHROPIC_AUTH_TOKEN"
+    - Model: ~/.claude/settings.json env "ANTHROPIC_MODEL"
+
+  Direct IP endpoint:
+    - API URL: http://165.245.166.41:30000/v1/chat/completions
+    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
+    - Model: GLM-5.2-FP8
+
+Never print or persist the token in source files.
 
 The orchestrator already encodes max_tokens=256000 with thinking_budget=200000
 (Anthropic-style thinking via the OpenAI-compatible API), a 3600-second HTTP
@@ -46,6 +55,24 @@ Bash command timeouts:
         --output solutions/imo2026_p1.md \
         > /tmp/imo26-run/stdout.log 2> /tmp/imo26-run/stderr.log &
 
+## First check after launch
+
+CRITICAL: Wait 30 seconds after launch, then check these files before doing
+anything else:
+
+    cat <run-dir>/progress.log
+    tail <run-dir>/stderr.log
+
+If progress.log shows any ERROR line, the orchestrator is failing. Common
+causes:
+  - Connection timeout to the API endpoint: wrong URL or endpoint is down
+  - 401 Unauthorized: wrong token for the chosen endpoint
+  - 422 Unprocessable Entity: model name not recognized
+
+Do NOT keep waiting if you see errors. Diagnose and fix the issue, then
+relaunch. Do NOT poll for sentinel files — the orchestrator never creates
+them.
+
 ## Monitoring - Claude Code specific
 
 Claude Code supports long-running Bash commands. Use a Bash for-loop with
@@ -65,6 +92,7 @@ it completes, then start another monitoring loop if needed.
 - Check state no more than once every 10 minutes of wall clock.
 - Only report when an iteration completes, an error occurs, or the run
   finishes.
+- Always check progress.log and stderr.log. Do NOT look for sentinel files.
 - Use tail -5 <run-dir>/progress.log and cat <run-dir>/state.json for
   quick checks.
 - The progress.log file has one line per state transition; tail it to see
@@ -95,4 +123,3 @@ summary.
 
 If all outer runs fail, report that no verified solution was found. Never
 promote a partial result or lower the acceptance threshold.
-

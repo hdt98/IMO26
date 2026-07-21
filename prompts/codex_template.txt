@@ -1,6 +1,6 @@
 Title: IMO 2026 P{n} - direct long-request workflow
 
-Solve IMO 2026 Problem {n} using the durable direct background workflow
+Solve IMO 2026 Problem 1 using the durable direct background workflow
 documented at workflows/codex.md in this repo.
 
 Authoritative problem ID: imo2026_p{n}
@@ -8,13 +8,17 @@ Authoritative problem file: problems/imo2026_p{n}.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
-API endpoint: http://165.245.166.41:30000/v1/chat/completions
-Model: GLM-5.2-FP8
-Token: extract from ~/.claude/settings.json env ANTHROPIC_AUTH_TOKEN
-
-Do NOT use ANTHROPIC_BASE_URL from ~/.claude/settings.json — that Nexus
-cloud URL is currently unreachable. Use the IP endpoint above with the
-ANTHROPIC_AUTH_TOKEN as the bearer token.
+Credentials — choose one endpoint and its matching token:
+  Cloud endpoint (from Codex config):
+    - API URL: ~/.codex/config.toml [model_providers.custom] base_url
+      + /chat/completions
+    - Token: ~/.codex/auth.json key "OPENAI_API_KEY"
+    - Model: ~/.codex/config.toml top-level "model"
+  Direct IP endpoint:
+    - API URL: http://165.245.166.41:30000/v1/chat/completions
+    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
+    - Model: GLM-5.2-FP8
+Never print or persist the token value.
 
 Launch the orchestrator inside a detached screen session, then wait 30
 seconds and check these files in the run directory:
