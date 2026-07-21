@@ -47,9 +47,9 @@ MAX_ERRORS = 10
 REQUIRED_PASSES = 5
 MAX_OUTER_RUNS = 10
 MAX_TOKENS = 256_000
+THINKING_BUDGET = 200_000
 HTTP_TIMEOUT = 3600
 MAX_TRANSPORT_RETRIES = 3
-TEMPERATURE = 0.1
 
 
 # -- Utilities --
@@ -84,7 +84,15 @@ def sha256_text(text):
 # -- API --
 
 def chat_completion(api_url, api_key, model, messages):
-    """Return (content, usage, finish_reason) from an OpenAI-compatible call."""
+    """Return (content, usage, finish_reason) from an OpenAI-compatible call.
+
+    The GLM-5.2-FP8 endpoint supports Anthropic-style thinking via the
+    OpenAI-compatible API. When thinking is enabled, the model reasons first
+    (consuming reasoning_tokens against the budget) then emits visible content.
+    The response message includes a reasoning_content field separate from
+    content. Empirically validated by the P3 run: the solver used 124650
+    reasoning tokens out of the 200000 budget and completed normally.
+    """
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -93,7 +101,8 @@ def chat_completion(api_url, api_key, model, messages):
         "model": model,
         "messages": messages,
         "max_tokens": MAX_TOKENS,
-        "temperature": TEMPERATURE,
+        "thinking": {"type": "enabled", "budget_tokens": THINKING_BUDGET},
+        "stream": False,
     }
     last_error = None
     for attempt in range(1, MAX_TRANSPORT_RETRIES + 1):
@@ -104,7 +113,8 @@ def chat_completion(api_url, api_key, model, messages):
             resp.raise_for_status()
             data = resp.json()
             choice = data["choices"][0]
-            content = choice["message"]["content"]
+            msg = choice.get("message", {}) or {}
+            content = msg.get("content") or ""
             usage = data.get("usage", {})
             finish = choice.get("finish_reason", "unknown")
             return content, usage, finish

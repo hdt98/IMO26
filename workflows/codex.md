@@ -23,8 +23,11 @@ configured model endpoint. It reads credentials from environment variables:
 Never print or persist the token. If credentials live in ~/.claude/settings.json
 under env, extract them at runtime without exposing values.
 
-Use max_tokens=256000, a 3600-second HTTP timeout, and no more than three
-transport retries. The orchestrator script already encodes these defaults.
+Use max_tokens=256000 with thinking_budget=200000 (Anthropic-style thinking
+via the OpenAI-compatible API), a 3600-second HTTP timeout, and no more than
+three transport retries. These values are proven from the P3 run: the solver
+used 124650 reasoning tokens out of the 200000 budget and completed normally
+with finish_reason=stop. The orchestrator script already encodes these defaults.
 
 ## Launch
 

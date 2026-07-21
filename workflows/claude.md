@@ -26,8 +26,11 @@ ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL), derive the
 OpenAI-compatible endpoint by appending /v1/chat/completions to the base URL
 and pass the same token. Never print or persist the token in source files.
 
-The orchestrator already encodes max_tokens=256000, a 3600-second HTTP timeout,
-and no more than three transport retries.
+The orchestrator already encodes max_tokens=256000 with thinking_budget=200000
+(Anthropic-style thinking via the OpenAI-compatible API), a 3600-second HTTP
+timeout, and no more than three transport retries. These values are proven from
+the P3 run: the solver used 124650 reasoning tokens out of the 200000 budget
+and completed normally with finish_reason=stop.
 
 ## Launch
 
