@@ -1,0 +1,24 @@
+Title: IMO 2026 P{n} - direct long-request workflow
+
+Solve IMO 2026 Problem {n} using the durable direct background workflow
+documented at workflows/claude.md in this repo.
+
+Authoritative problem ID: imo2026_p{n}
+Authoritative problem file: problems/imo2026_p{n}.txt
+
+Read the workflow contract completely before acting and follow it exactly.
+
+Begin executing immediately after reading the contract. You have a hard budget
+of 4 consecutive responses before the turn is aborted - every response must
+include at least one tool call. Break work into small phases and act on each
+one; do not spend multiple responses on extended thinking alone, or the session
+will terminate the turn.
+
+This must be a fresh, independent run. Do not read prior solutions, run logs,
+verification reports, scratch work, or artifacts. The Desktop parent is an
+orchestrator only and may not solve or grade the mathematics. Keep the Goal
+active until the background workflow either persists a candidate that earns
+five consecutive independent passes or records a legitimate terminal failure.
+
+Do not interpret a UI wait timeout as a stream failure, do not silently
+duplicate active requests, and do not lower the acceptance threshold.
