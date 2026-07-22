@@ -88,8 +88,8 @@ PRESENTATION_LIMIT_NOTE = (
 )
 
 PIVOT_HINT = (
-    "Note: A previous attempt at this problem failed verification. ",
-    "Try a fundamentally different approach — different key idea, ",
+    "Note: A previous attempt at this problem failed verification. "
+    "Try a fundamentally different approach — different key idea, "
     "different technique, or different angle of attack."
 )
 
