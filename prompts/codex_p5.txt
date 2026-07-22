@@ -1,10 +1,10 @@
-Title: IMO 2026 P{n} - direct long-request workflow
+Title: IMO 2026 P5 - direct long-request workflow
 
-Solve IMO 2026 Problem {n} using the durable direct background workflow
+Solve IMO 2026 Problem 5 using the durable direct background workflow
 documented at workflows/codex.md in this repo.
 
-Authoritative problem ID: imo2026_p{n}
-Authoritative problem file: problems/imo2026_p{n}.txt
+Authoritative problem ID: imo2026_p5
+Authoritative problem file: problems/imo2026_p5.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 

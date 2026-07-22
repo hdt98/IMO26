@@ -9,16 +9,13 @@ the mathematics itself.
 1. Read the problem file from problems/.
 2. Read code/prompts.py and code/orchestrator.py to understand the algorithm.
 3. Create a fresh run directory: /tmp/imo26-<problem-id>-<UTC-timestamp>.
-4. Write the orchestrator script to the run directory (or use the repo copy).
 
 ## Transport
 
 The orchestrator makes OpenAI-compatible chat completion calls directly to the
-configured model endpoint. It reads credentials from environment variables:
-
-- IMO_SOLVER_API_URL - the chat completions endpoint
-- IMO_SOLVER_TOKEN - bearer token
-- IMO_SOLVER_MODEL - model name
+configured model endpoint. Always pass --api-url, --api-key, and --model
+explicitly as command-line arguments. Do not rely on environment variable
+inheritance.
 
 Two endpoints are available. Choose one and use its matching token:
 
@@ -34,40 +31,33 @@ Two endpoints are available. Choose one and use its matching token:
 
 Never print or persist the token. Extract it at runtime without exposing values.
 
-Use max_tokens=256000 with thinking_budget=200000 (Anthropic-style thinking
-via the OpenAI-compatible API), a 3600-second HTTP timeout, and no more than
-three transport retries. These values are proven from the P3 run: the solver
-used 124650 reasoning tokens out of the 200000 budget and completed normally
-with finish_reason=stop. The orchestrator script already encodes these defaults.
+The orchestrator encodes proven defaults: max_tokens=256000,
+thinking_budget=200000, HTTP_TIMEOUT=3600, MAX_TRANSPORT_RETRIES=3,
+MAX_ERRORS=3 (consecutive failures before run restart), REQUIRED_PASSES=5.
 
-## Launch
+## Launch (exec_command - no screen)
 
-Launch the orchestrator inside a detached screen session so it survives
-exec_command yielding:
+Launch the orchestrator directly via exec_command. The process becomes a child
+of the Codex app-server, so it is automatically cleaned up when the goal is
+stopped or the app exits. No screen session is needed.
 
-    screen -S imo_<problem-id> -X quit 2>/dev/null
+Run this command via exec_command (yield_time_ms=3000):
 
-    screen -dmS imo_<problem-id> bash -c \
-      'cd <run-dir> && \
-       IMO_SOLVER_TOKEN=<token> \
-       IMO_SOLVER_API_URL=<endpoint> \
-       IMO_SOLVER_MODEL=<model> \
-       python3 orchestrator.py \
-         --problem <repo>/problems/<problem-file> \
-         --api-url <endpoint> \
-         --api-key <token> \
-         --model <model> \
-         --run-dir <run-dir> \
-         --output <repo>/solutions/<problem-id>.md \
-         > stdout.log 2> stderr.log'
+    python3 /Users/sonln4/IMO26/code/orchestrator.py \
+      --problem /Users/sonln4/IMO26/problems/<problem-file> \
+      --api-url <endpoint> \
+      --api-key <token> \
+      --model <model> \
+      --run-dir <run-dir> \
+      --output /Users/sonln4/IMO26/solutions/<problem-id>.md \
+      > <run-dir>/stdout.log 2> <run-dir>/stderr.log
 
-Always pass --api-url, --api-key, and --model explicitly as command-line
-arguments. Do not rely on environment variable inheritance.
+The exec_command call returns a session_id immediately (the process is still
+running). Save this session_id for monitoring with write_stdin.
 
 ## First check after launch
 
-CRITICAL: Wait 30 seconds after launch, then check these files before doing
-anything else:
+CRITICAL: Wait 30 seconds after launch, then check these files:
 
     cat <run-dir>/progress.log
     tail <run-dir>/stderr.log
@@ -78,84 +68,97 @@ causes:
   - 401 Unauthorized: wrong token for the chosen endpoint
   - 422 Unprocessable Entity: model name not recognized
 
-Do NOT keep waiting if you see errors. Diagnose and fix the issue, then
-relaunch. Do NOT poll for sentinel files — the orchestrator never creates
-them. The only files it writes are: progress.log, state.json, stdout.log,
-stderr.log, and per-run artifact directories.
+Do NOT keep waiting if you see errors. Diagnose and fix, then relaunch.
+Do NOT poll for sentinel files - the orchestrator never creates them.
+Files written: progress.log, state.json, stdout.log, stderr.log, and
+per-run artifact directories.
 
-## Monitoring - Codex Desktop specific
+## Monitoring
 
-CRITICAL: Do NOT use sleep inside exec_command. The exec_command tool yields
-after at most 30 seconds and the PTY closure kills the process. This creates a
-busy-wait loop that fills the context with polling noise and triggers context
-compaction.
+Monitor using write_stdin (to detect completion) and exec_command (to check
+progress files).
 
-Do NOT create a separate "monitor" screen session. Check progress directly:
+### Monitoring loop
 
-    tail -5 <run-dir>/progress.log
-    cat <run-dir>/state.json
+Repeat this cycle until the orchestrator completes:
 
-### Process liveness check
+1. Call write_stdin with the session_id, empty chars, and
+   yield_time_ms=300000 (5 minutes). This blocks for up to 5 minutes.
+   - If exit_code is returned: the orchestrator finished. Check results.
+   - If no exit_code: still running. Continue to step 2.
 
-CRITICAL: Before reading progress.log, check if the orchestrator process is
-still alive. The screen session may have been killed, taking the process
-with it, without updating state.json.
+2. Check progress via a separate exec_command:
+       tail -5 <run-dir>/progress.log
+       cat <run-dir>/state.json
 
-    ps -p <pid>   # PID from the launch step
+3. Report significant events only (passes, errors, acceptance, failure).
+   Do NOT report every polling cycle.
 
-If the PID is gone, the orchestrator died. RESTART it immediately in a new
-screen session with the same arguments. Do NOT monitor or piggyback on
-another session's run — each session must own and manage its own orchestrator
-independently. "Do not silently duplicate active requests" refers to YOUR
-session's own active request only; another session running the same problem
-does not count as duplication.
+### State.json lag warning
+
+state.json is saved at the TOP of each loop iteration, BEFORE the reset
+logic runs. This means consecutive_passes and error_count may show stale
+values from the previous iteration. The actual in-memory values are correct
+but not yet written to disk. Do not be alarmed if state.json shows
+consecutive_passes=3 right after a FAIL - the reset to 0 has already
+happened in memory and will be reflected in the next state.json save.
+
+### Built-in protections
+
+The orchestrator has two built-in protections that work without agent
+intervention:
+
+1. Wall-clock timeout: signal.alarm fires after 3600 seconds (1 hour)
+   per API call, regardless of server keepalive. If the server sends
+   partial data that prevents the HTTP read timeout from firing, the
+   alarm still triggers, causing a retry. No external watchdog needed.
+
+2. Pivot mechanism: after 3 consecutive verification failures
+   (MAX_ERRORS=3), the current run fails and a new outer run starts
+   with a fresh SOLVE. The solver prompt includes a PIVOT_HINT on
+   outer_run > 1, telling the model to try a fundamentally different
+   approach. This prevents wasting time on wrong approaches.
 
 ### Monitoring discipline
 
-- Check state no more than once every 10 minutes.
+- Poll no more than once every 5 minutes.
 - Only report when an iteration completes or an error occurs.
-- Always check progress.log and stderr.log. Do NOT look for sentinel files.
-- Do NOT write complex monitor scripts with heredocs or embedded Python;
-  they break due to shell escaping issues.
-- Use tail -5 <run-dir>/progress.log and cat <run-dir>/state.json for quick checks.
-- The progress.log file has one line per state transition; tail it to see what
-  happened since the last check.
+- Do NOT create a separate monitor process or screen session.
+- Do NOT write complex monitor scripts with heredocs or embedded Python.
 
-## Context management
+## Resume after goal stop
 
-The orchestrator writes a one-line summary to progress.log on every state
-transition. This is the primary monitoring interface. After each check, read
-state.json for full state (outer_run, iteration, consecutive_passes,
-error_count, accepted, status).
+If the goal was stopped and later resumed:
+
+1. Check if the orchestrator process is still alive:
+       ps aux | grep '[o]rchestrator.py.*<problem-id>'
+
+2. If alive: resume monitoring. Find its run directory from the ps
+   output and check progress.log/state.json.
+
+3. If not alive: start a new run with a new run directory. The old
+   run's artifacts are preserved for reference.
 
 ## Cleanup
 
-After the goal is achieved or failed, the agent should clean up its own
-processes:
+When the orchestrator finishes (write_stdin returns exit_code), the
+process has already exited and the session is automatically closed.
+No manual cleanup is needed.
 
-    kill <orchestrator-pid>
-    screen -S <screen-name> -X quit 2>/dev/null
+If the goal is stopped mid-flight, the Codex framework kills the
+exec_command child process automatically. No orphaned processes remain.
 
-Do NOT kill processes that belong to other sessions. If the goal was stopped
-mid-flight (not completed), stale processes can be identified with:
-
+To identify stale processes from other sessions:
     bash scripts/cleanup.sh
 
-This lists all active orchestrator processes, screen sessions, and monitoring
-loops with their PIDs and run directories. Kill specific stale ones by PID:
-
+Kill specific stale ones by PID:
     bash scripts/cleanup.sh <pid>
-
-Or by run directory:
-
-    bash scripts/cleanup.sh <run-dir>
 
 ## Completion
 
 On five consecutive passes, the orchestrator copies the accepted candidate to
-the output path and writes a final manifest with its SHA-256 hash. The agent
-may then report completion with the run directory, output path, and token
-summary.
+the output path and writes a manifest with its SHA-256 hash. Report completion
+with the run directory, output path, and token summary.
 
 If all outer runs fail, report that no verified solution was found. Never
 promote a partial result or lower the acceptance threshold.
