@@ -133,6 +133,21 @@ the Claude Code environment. But the preferred fix is to keep responses short:
 launch the background process, then use concise monitoring loops rather than
 generating long inline analysis.
 
+## Cleanup
+
+After the goal is achieved or failed, the agent should clean up its own
+orchestrator process (kill <pid>). Do NOT kill processes that belong to
+other sessions. If the goal was stopped mid-flight, stale processes can be
+identified with:
+
+    bash scripts/cleanup.sh
+
+This lists all active processes with PIDs and run directories. Kill specific
+stale ones by PID or run directory:
+
+    bash scripts/cleanup.sh <pid>
+    bash scripts/cleanup.sh <run-dir>
+
 ## Completion
 
 On five consecutive passes, the orchestrator copies the accepted candidate to

@@ -128,6 +128,28 @@ transition. This is the primary monitoring interface. After each check, read
 state.json for full state (outer_run, iteration, consecutive_passes,
 error_count, accepted, status).
 
+## Cleanup
+
+After the goal is achieved or failed, the agent should clean up its own
+processes:
+
+    kill <orchestrator-pid>
+    screen -S <screen-name> -X quit 2>/dev/null
+
+Do NOT kill processes that belong to other sessions. If the goal was stopped
+mid-flight (not completed), stale processes can be identified with:
+
+    bash scripts/cleanup.sh
+
+This lists all active orchestrator processes, screen sessions, and monitoring
+loops with their PIDs and run directories. Kill specific stale ones by PID:
+
+    bash scripts/cleanup.sh <pid>
+
+Or by run directory:
+
+    bash scripts/cleanup.sh <run-dir>
+
 ## Completion
 
 On five consecutive passes, the orchestrator copies the accepted candidate to

@@ -45,6 +45,9 @@ the Goal active until the background workflow either persists a candidate
 that earns five consecutive independent passes or records a legitimate
 terminal failure.
 
+After the goal is achieved or failed, clean up your own orchestrator
+process (kill <pid>). Do NOT kill processes that belong to other sessions.
+
 Do not interpret a UI wait timeout as a stream failure, do not silently
 duplicate active requests (this means YOUR session's own requests only —
 another session running the same problem is not duplication), and do not
