@@ -20,18 +20,27 @@ Credentials — choose one endpoint and its matching token:
     - Model: GLM-5.2-FP8
 Never print or persist the token value.
 
-Launch the orchestrator inside a detached screen session, then wait 30
-seconds and check these files in the run directory:
+Name the screen session imo_<problem_id> (e.g., imo_p6). Before launching,
+kill any stale session: screen -S imo_<problem_id> -X quit 2>/dev/null.
+Always pass --api-url, --api-key, and --model explicitly as command-line
+arguments. Launch the orchestrator inside the detached screen session, then
+wait 30 seconds and check these files in the run directory:
   1. cat <run-dir>/progress.log — one line per state transition or error
   2. tail <run-dir>/stderr.log — API call failures and tracebacks
 If progress.log shows any ERROR line, the run is failing. Do not keep
 waiting; diagnose the error and fix it before retrying. Do NOT poll for
 sentinel files — the orchestrator never creates them.
 
-Monitor the background orchestrator at most once every 10 minutes using a
-detached screen session. Do NOT use sleep inside exec_command (it will
+Monitor the background orchestrator at most once every 10 minutes by
+checking progress.log and state.json directly. Do NOT create a separate
+"monitor" screen session. Do NOT use sleep inside exec_command (it will
 be killed when the tool yields). Do NOT poll more frequently than every
 10 minutes. Only report when an iteration completes or an error occurs.
+
+Before each check, verify the orchestrator PID is still alive (ps -p <pid>).
+If the PID is gone, RESTART the orchestrator immediately — do NOT monitor
+or piggyback on another session's run. "Do not silently duplicate active
+requests" refers to YOUR session's own active request only.
 
 This must be a fresh, independent run. Do not read prior solutions, run
 logs, verification reports, scratch work, or artifacts. The Desktop parent
@@ -41,4 +50,6 @@ that earns five consecutive independent passes or records a legitimate
 terminal failure.
 
 Do not interpret a UI wait timeout as a stream failure, do not silently
-duplicate active requests, and do not lower the acceptance threshold.
+duplicate active requests (this means YOUR session's own requests only —
+another session running the same problem is not duplication), and do not
+lower the acceptance threshold.

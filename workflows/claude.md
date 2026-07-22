@@ -43,6 +43,10 @@ and completed normally with finish_reason=stop.
 
 ## Launch
 
+Before launching, kill any stale orchestrator process for this problem:
+
+    pkill -f "orchestrator.py.*<problem-id>" 2>/dev/null
+
 Launch the orchestrator as a detached background process so it survives
 Bash command timeouts:
 
@@ -86,6 +90,21 @@ sleep to poll the progress log without busy-waiting:
 
 This runs for up to 60 minutes in a single Bash call. Check the output after
 it completes, then start another monitoring loop if needed.
+
+### Process liveness check
+
+CRITICAL: Before reading progress.log, check if the orchestrator process is
+still alive. The nohup process may have been killed or crashed without
+updating state.json.
+
+    ps -p <pid>   # PID from the launch step
+
+If the PID is gone, the orchestrator died. RESTART it immediately with the
+same arguments. Do NOT monitor or piggyback on another session's run — each
+session must own and manage its own orchestrator independently. "Do not
+silently duplicate active requests" refers to YOUR session's own active
+request only; another session running the same problem does not count as
+duplication.
 
 ### Monitoring discipline
 

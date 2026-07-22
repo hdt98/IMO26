@@ -34,6 +34,10 @@ If progress.log shows any ERROR line, the run is failing. Do not keep
 waiting; diagnose the error and fix it before retrying. Do NOT poll for
 sentinel files — the orchestrator never creates them.
 
+Before each monitoring check, verify the orchestrator PID is still alive
+(ps -p <pid>). If the PID is gone, RESTART the orchestrator immediately —
+do NOT monitor or piggyback on another session's run.
+
 This must be a fresh, independent run. Do not read prior solutions, run
 logs, verification reports, scratch work, or artifacts. The Desktop parent
 is an orchestrator only and may not solve or grade the mathematics. Keep
@@ -42,4 +46,6 @@ that earns five consecutive independent passes or records a legitimate
 terminal failure.
 
 Do not interpret a UI wait timeout as a stream failure, do not silently
-duplicate active requests, and do not lower the acceptance threshold.
+duplicate active requests (this means YOUR session's own requests only —
+another session running the same problem is not duplication), and do not
+lower the acceptance threshold.

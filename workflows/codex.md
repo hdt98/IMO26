@@ -45,16 +45,24 @@ with finish_reason=stop. The orchestrator script already encodes these defaults.
 Launch the orchestrator inside a detached screen session so it survives
 exec_command yielding:
 
-    screen -dmS imo_solver bash -c \
+    screen -S imo_<problem-id> -X quit 2>/dev/null
+
+    screen -dmS imo_<problem-id> bash -c \
       'cd <run-dir> && \
        IMO_SOLVER_TOKEN=<token> \
        IMO_SOLVER_API_URL=<endpoint> \
        IMO_SOLVER_MODEL=<model> \
        python3 orchestrator.py \
          --problem <repo>/problems/<problem-file> \
+         --api-url <endpoint> \
+         --api-key <token> \
+         --model <model> \
          --run-dir <run-dir> \
          --output <repo>/solutions/<problem-id>.md \
          > stdout.log 2> stderr.log'
+
+Always pass --api-url, --api-key, and --model explicitly as command-line
+arguments. Do not rely on environment variable inheritance.
 
 ## First check after launch
 
@@ -82,24 +90,25 @@ after at most 30 seconds and the PTY closure kills the process. This creates a
 busy-wait loop that fills the context with polling noise and triggers context
 compaction.
 
-Instead, use one of these patterns:
+Do NOT create a separate "monitor" screen session. Check progress directly:
 
-### Pattern A: Screen-based monitor (recommended)
+    tail -5 <run-dir>/progress.log
+    cat <run-dir>/state.json
 
-Create a monitor screen session that writes progress to a file:
+### Process liveness check
 
-    screen -dmS monitor bash -c \
-      'while true; do tail -1 <run-dir>/progress.log > <run-dir>/monitor_latest.txt 2>/dev/null; sleep 600; done'
+CRITICAL: Before reading progress.log, check if the orchestrator process is
+still alive. The screen session may have been killed, taking the process
+with it, without updating state.json.
 
-Then check periodically (every 10-15 minutes):
+    ps -p <pid>   # PID from the launch step
 
-    cat <run-dir>/monitor_latest.txt
-
-### Pattern B: Long for-loop with nohup
-
-    nohup bash -c 'for i in $(seq 1 30); do sleep 60; tail -1 <run-dir>/progress.log; done' > <run-dir>/monitor_output.txt 2>&1 &
-
-Then check: cat <run-dir>/monitor_output.txt
+If the PID is gone, the orchestrator died. RESTART it immediately in a new
+screen session with the same arguments. Do NOT monitor or piggyback on
+another session's run — each session must own and manage its own orchestrator
+independently. "Do not silently duplicate active requests" refers to YOUR
+session's own active request only; another session running the same problem
+does not count as duplication.
 
 ### Monitoring discipline
 
