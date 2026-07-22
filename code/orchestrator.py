@@ -45,7 +45,10 @@ from prompts import (
 # -- Constants --
 
 MAX_ITERATIONS = 30
-MAX_ERRORS = 10
+MAX_ERRORS = 3  # consecutive failures before run restarts (was 10)
+# Lowered to 3: if the model cannot fix its approach in 3 corrections,
+# it is likely on a fundamentally wrong track. A fresh SOLVE with a
+# pivot hint gives a better chance than more corrections.
 REQUIRED_PASSES = 5
 MAX_OUTER_RUNS = 10
 MAX_TOKENS = 256_000
@@ -82,6 +85,12 @@ NEUTRAL_COMPLETE_REQUEST = (
 PRESENTATION_LIMIT_NOTE = (
     "\n\n(Presentation limit: keep your complete final response under 2500 words. "
     "This is a presentation limit only, not a mathematical constraint or hint.)"
+)
+
+PIVOT_HINT = (
+    "Note: A previous attempt at this problem failed verification. ",
+    "Try a fundamentally different approach — different key idea, ",
+    "different technique, or different angle of attack."
 )
 
 
@@ -190,8 +199,10 @@ DNL = "\n\n"
 DIV = "\n" + "=" * 70 + "\n"
 
 
-def build_solver_messages(problem):
+def build_solver_messages(problem, outer_run=1):
     user = problem.strip() + PRESENTATION_LIMIT_NOTE
+    if outer_run > 1:
+        user += chr(10) + chr(10) + PIVOT_HINT
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": user},
@@ -288,7 +299,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
 
     # -- SOLVE --
     log_progress(run_dir, f"RUN {outer_run} SOLVE: start")
-    solution = call(build_solver_messages(problem), "SOLVE")
+    solution = call(build_solver_messages(problem, outer_run), "SOLVE")
     save_text(subdir, "draft.md", solution)
 
     # -- SELF-IMPROVE --
