@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 import traceback
@@ -51,6 +52,27 @@ MAX_TOKENS = 256_000
 THINKING_BUDGET = 200_000
 HTTP_TIMEOUT = 3600
 MAX_TRANSPORT_RETRIES = 3
+
+# Wall-clock timeout per API call. Python requests timeout is a read
+# timeout (time between bytes received), not a total timeout. Server
+# keepalive or partial data resets the read timer indefinitely, causing
+# processes to hang at 0% CPU forever (observed on P2 SOLVE). The
+# signal.alarm fires regardless of what the server sends.
+# Set to 3600 (same as HTTP_TIMEOUT) so legitimate long-running calls
+# are unaffected - only truly stuck processes are caught.
+WALL_CLOCK_TIMEOUT = 3600  # max wall-clock per API call
+
+
+class _WallClockTimeout(Exception):
+    """Raised when signal.alarm fires during an API call."""
+
+
+def _alarm_handler(signum, frame):
+    raise _WallClockTimeout(
+        f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s "
+        "(server may be sending keepalive without real data)"
+    )
+
 
 NEUTRAL_COMPLETE_REQUEST = (
     "Please return your complete final response now, keeping it under 2500 words. "
@@ -129,9 +151,15 @@ def chat_completion(api_url, api_key, model, messages):
     last_error = None
     for attempt in range(1, MAX_TRANSPORT_RETRIES + 1):
         try:
-            resp = requests.post(
-                api_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
-            )
+            old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(WALL_CLOCK_TIMEOUT)
+            try:
+                resp = requests.post(
+                    api_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
+                )
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
             resp.raise_for_status()
             data = resp.json()
             choice = data["choices"][0]
