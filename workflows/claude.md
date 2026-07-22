@@ -9,17 +9,15 @@ the mathematics itself.
 1. Read the problem file from problems/.
 2. Read code/prompts.py and code/orchestrator.py to understand the algorithm.
 3. Create a fresh run directory: /tmp/imo26-<problem-id>-<UTC-timestamp>.
-4. Use the repo copy of orchestrator.py directly; do not regenerate it.
 
 ## Transport
 
 The orchestrator makes OpenAI-compatible chat completion calls directly to the
-configured model endpoint. It reads credentials from environment variables
-or command-line flags:
+configured model endpoint. It reads credentials from command-line flags:
 
-- --api-url (or IMO_SOLVER_API_URL) - the chat completions endpoint
-- --api-key (or IMO_SOLVER_TOKEN)  - bearer token
-- --model   (or IMO_SOLVER_MODEL)  - model name
+- --api-url  - the chat completions endpoint
+- --api-key  - bearer token
+- --model    - model name
 
 Two endpoints are available. Choose one and use its matching token:
 
@@ -35,34 +33,37 @@ Two endpoints are available. Choose one and use its matching token:
 
 Never print or persist the token in source files.
 
-The orchestrator already encodes max_tokens=256000 with thinking_budget=200000
-(Anthropic-style thinking via the OpenAI-compatible API), a 3600-second HTTP
-timeout, and no more than three transport retries. These values are proven from
+The orchestrator already encodes max_tokens=256000 with thinking_budget=200000,
+a 3600-second HTTP timeout, a 3600-second wall-clock timeout (signal.alarm),
+and no more than three transport retries. These values are proven from
 the P3 run: the solver used 124650 reasoning tokens out of the 200000 budget
 and completed normally with finish_reason=stop.
 
-## Launch
+## Launch (run_in_background - no nohup, no screen)
 
-Before launching, kill any stale orchestrator process for this problem:
+Launch the orchestrator using the Bash tool with run_in_background: true.
+This gives Claude Code a backgroundTaskId for tracking and writes output to
+a managed file. The process survives session stops by design - this is
+desired for long-running orchestrator runs that may take 30+ minutes.
 
-    pkill -f "orchestrator.py.*<problem-id>" 2>/dev/null
-
-Launch the orchestrator as a detached background process so it survives
-Bash command timeouts:
-
-    nohup python3 code/orchestrator.py \
+    python3 code/orchestrator.py \
         --problem problems/imo2026_p1.txt \
-        --api-url "$OPENAI_API_URL" \
-        --api-key "$OPENAI_API_KEY" \
+        --api-url "$API_URL" \
+        --api-key "$API_KEY" \
         --model "$MODEL_NAME" \
         --run-dir /tmp/imo26-imo2026_p1-TIMESTAMP \
-        --output solutions/imo2026_p1.md \
-        > /tmp/imo26-run/stdout.log 2> /tmp/imo26-run/stderr.log &
+        --output solutions/imo2026_p1.md
+
+Set run_in_background: true in the Bash tool call. Do NOT use nohup, &, or
+screen - run_in_background: true provides proper task tracking and process
+management. Save the backgroundTaskId, the PID, and the run directory path.
+
+To get the PID after launch, run:
+    ps aux | grep '[o]rchestrator.py.*<problem-id>'
 
 ## First check after launch
 
-CRITICAL: Wait 30 seconds after launch, then check these files before doing
-anything else:
+CRITICAL: Wait 30 seconds after launch, then check these files:
 
     cat <run-dir>/progress.log
     tail <run-dir>/stderr.log
@@ -74,37 +75,67 @@ causes:
   - 422 Unprocessable Entity: model name not recognized
 
 Do NOT keep waiting if you see errors. Diagnose and fix the issue, then
-relaunch. Do NOT poll for sentinel files — the orchestrator never creates
+relaunch. Do NOT poll for sentinel files - the orchestrator never creates
 them.
 
-## Monitoring - Claude Code specific
+## Monitoring
 
-Claude Code supports long-running Bash commands. Use a Bash for-loop with
-sleep to poll the progress log without busy-waiting:
+Monitor using the Bash tool to check progress files. Claude Code will notify
+you when the background task completes.
 
-    for i in $(seq 1 60); do
-        sleep 60
-        tail -5 /tmp/imo26-run/progress.log 2>/dev/null
-        echo "---"
-    done
+### Monitoring loop
 
-This runs for up to 60 minutes in a single Bash call. Check the output after
-it completes, then start another monitoring loop if needed.
+Repeat this cycle until the orchestrator completes:
+
+1. Use a Bash command to check progress:
+       tail -5 <run-dir>/progress.log
+       cat <run-dir>/state.json
+
+2. Check process liveness:
+       ps -p <pid>
+
+3. Report significant events only (passes, errors, acceptance, failure).
+   Do NOT report every polling cycle.
 
 ### Process liveness check
 
 CRITICAL: Before reading progress.log, check if the orchestrator process is
-still alive. The nohup process may have been killed or crashed without
+still alive. The background process may have been killed or crashed without
 updating state.json.
 
     ps -p <pid>   # PID from the launch step
 
 If the PID is gone, the orchestrator died. RESTART it immediately with the
-same arguments. Do NOT monitor or piggyback on another session's run — each
+same arguments. Do NOT monitor or piggyback on another session's run - each
 session must own and manage its own orchestrator independently. "Do not
 silently duplicate active requests" refers to YOUR session's own active
 request only; another session running the same problem does not count as
 duplication.
+
+### State.json lag warning
+
+state.json is saved at the TOP of each loop iteration, BEFORE the reset
+logic runs. This means consecutive_passes and error_count may show stale
+values from the previous iteration. The actual in-memory values are correct
+but not yet written to disk. Do not be alarmed if state.json shows
+consecutive_passes=3 right after a FAIL - the reset to 0 has already
+happened in memory and will be reflected in the next state.json save.
+
+### Built-in protections
+
+The orchestrator has two built-in protections that work without agent
+intervention:
+
+1. Wall-clock timeout: signal.alarm fires after 3600 seconds (1 hour)
+   per API call, regardless of server keepalive. If the server sends
+   partial data that prevents the HTTP read timeout from firing, the
+   alarm still triggers, causing a retry. No external watchdog needed.
+
+2. Pivot mechanism: after 3 consecutive verification failures
+   (MAX_ERRORS=3), the current run fails and a new outer run starts
+   with a fresh SOLVE. The solver prompt includes a PIVOT_HINT on
+   outer_run > 1, telling the model to try a fundamentally different
+   approach. This prevents wasting time on wrong approaches.
 
 ### Monitoring discipline
 
@@ -117,6 +148,42 @@ duplication.
 - The progress.log file has one line per state transition; tail it to see
   what happened since the last check.
 - Do NOT write complex monitor scripts with heredocs or embedded Python.
+
+## Resume after goal stop
+
+If the goal was stopped and later resumed:
+
+1. Check if the orchestrator process is still alive:
+       ps aux | grep '[o]rchestrator.py.*<problem-id>'
+
+2. If alive: resume monitoring. Find its run directory from the ps
+   output and check progress.log/state.json.
+
+3. If not alive: start a new run with a new run directory. The old
+   run's artifacts are preserved for reference.
+
+Note: Backgrounded processes survive goal stops by design. This is
+desired - the orchestrator should keep running even if the Claude Code
+session is interrupted. The process is NOT automatically killed when
+the goal is stopped.
+
+## Cleanup
+
+When the orchestrator finishes (progress.log shows ACCEPTED or FAILED),
+kill the background process:
+
+    kill <pid>
+
+If the goal was stopped mid-flight, stale processes can be identified with:
+
+    bash scripts/cleanup.sh
+
+Kill specific stale ones by PID or run directory:
+
+    bash scripts/cleanup.sh <pid>
+    bash scripts/cleanup.sh <run-dir>
+
+Do NOT kill processes that belong to other sessions.
 
 ## Context and budget management
 
@@ -133,20 +200,14 @@ the Claude Code environment. But the preferred fix is to keep responses short:
 launch the background process, then use concise monitoring loops rather than
 generating long inline analysis.
 
-## Cleanup
+## About the 600000ms timeout
 
-After the goal is achieved or failed, the agent should clean up its own
-orchestrator process (kill <pid>). Do NOT kill processes that belong to
-other sessions. If the goal was stopped mid-flight, stale processes can be
-identified with:
-
-    bash scripts/cleanup.sh
-
-This lists all active processes with PIDs and run directories. Kill specific
-stale ones by PID or run directory:
-
-    bash scripts/cleanup.sh <pid>
-    bash scripts/cleanup.sh <run-dir>
+The Anthropic SDK's default timeout is 600000ms (10 minutes) for non-streaming
+API requests. This does NOT affect the orchestrator, which makes its own API
+calls directly to the model endpoint with a 3600-second timeout. Claude Code
+uses streaming with API_TIMEOUT_MS=3000000 (50 minutes), so its own API calls
+are not affected either. The 600000ms timeout is NOT a blocker for this
+workflow.
 
 ## Completion
 

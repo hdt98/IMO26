@@ -1,10 +1,10 @@
-Title: IMO 2026 P1 - direct long-request workflow
+Title: IMO 2026 P3 - direct long-request workflow
 
-Solve IMO 2026 Problem 1 using the durable direct background workflow
+Solve IMO 2026 Problem 3 using the durable direct background workflow
 documented at workflows/claude.md in this repo.
 
-Authoritative problem ID: imo2026_p1
-Authoritative problem file: problems/imo2026_p1.txt
+Authoritative problem ID: imo2026_p3
+Authoritative problem file: problems/imo2026_p3.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 

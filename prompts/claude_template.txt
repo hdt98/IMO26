@@ -1,6 +1,6 @@
 Title: IMO 2026 P{n} - direct long-request workflow
 
-Solve IMO 2026 Problem 1 using the durable direct background workflow
+Solve IMO 2026 Problem {n} using the durable direct background workflow
 documented at workflows/claude.md in this repo.
 
 Authoritative problem ID: imo2026_p{n}
@@ -8,7 +8,7 @@ Authoritative problem file: problems/imo2026_p{n}.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
-Credentials — choose one endpoint and its matching token:
+Credentials - choose one endpoint and its matching token:
   Cloud endpoint (from Claude settings):
     - API URL: ~/.claude/settings.json env "ANTHROPIC_BASE_URL"
       + /chat/completions
@@ -20,23 +20,32 @@ Credentials — choose one endpoint and its matching token:
     - Model: GLM-5.2-FP8
 Never print or persist the token value.
 
-Begin executing immediately after reading the contract. You have a hard budget
-of 4 consecutive responses before the turn is aborted - every response must
-include at least one tool call. Break work into small phases and act on each
-one; do not spend multiple responses on extended thinking alone, or the session
-will terminate the turn.
+Launch the orchestrator using the Bash tool with run_in_background: true
+(NOT nohup, NOT screen). This gives Claude Code a backgroundTaskId for
+tracking. The process survives session stops by design, which is desired
+for long-running orchestrator runs. Always pass --api-url, --api-key, and
+--model explicitly as command-line arguments.
 
-After launching the orchestrator, wait 30 seconds then check these files
+After launching, wait 30 seconds then check these files
 in the run directory:
-  1. cat <run-dir>/progress.log — one line per state transition or error
-  2. tail <run-dir>/stderr.log — API call failures and tracebacks
+  1. cat <run-dir>/progress.log - one line per state transition or error
+  2. tail <run-dir>/stderr.log - API call failures and tracebacks
 If progress.log shows any ERROR line, the run is failing. Do not keep
 waiting; diagnose the error and fix it before retrying. Do NOT poll for
-sentinel files — the orchestrator never creates them.
+sentinel files - the orchestrator never creates them.
 
 Before each monitoring check, verify the orchestrator PID is still alive
-(ps -p <pid>). If the PID is gone, RESTART the orchestrator immediately —
+(ps -p <pid>). If the PID is gone, RESTART the orchestrator immediately -
 do NOT monitor or piggyback on another session's run.
+
+The orchestrator has built-in protections that work without agent
+intervention: a wall-clock timeout (signal.alarm, 3600s per API call) that
+prevents hung processes, and a pivot mechanism (3 consecutive failures
+triggers a fresh SOLVE with a different-approach hint). Do not interfere
+with these mechanisms.
+
+Note: state.json may show stale consecutive_passes values because it is
+saved before the reset logic runs. The actual in-memory values are correct.
 
 This must be a fresh, independent run. Do not read prior solutions, run
 logs, verification reports, scratch work, or artifacts. The Desktop parent
@@ -47,8 +56,10 @@ terminal failure.
 
 After the goal is achieved or failed, clean up your own orchestrator
 process (kill <pid>). Do NOT kill processes that belong to other sessions.
+If the goal was stopped and resumed, check if the orchestrator process
+is still alive - if alive, resume monitoring; if not, start a fresh run.
 
 Do not interpret a UI wait timeout as a stream failure, do not silently
-duplicate active requests (this means YOUR session's own requests only —
+duplicate active requests (this means YOUR session's own requests only -
 another session running the same problem is not duplication), and do not
 lower the acceptance threshold.
