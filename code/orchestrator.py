@@ -52,6 +52,16 @@ THINKING_BUDGET = 200_000
 HTTP_TIMEOUT = 3600
 MAX_TRANSPORT_RETRIES = 3
 
+NEUTRAL_COMPLETE_REQUEST = (
+    "Please return your complete final response now, keeping it under 2500 words. "
+    "Do not restate the problem. Provide only your final answer following the required output format."
+)
+
+PRESENTATION_LIMIT_NOTE = (
+    "\n\n(Presentation limit: keep your complete final response under 2500 words. "
+    "This is a presentation limit only, not a mathematical constraint or hint.)"
+)
+
 
 # -- Utilities --
 
@@ -80,6 +90,17 @@ def save_text(directory, filename, content):
 
 def sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def is_standalone_yes(text):
+    """Accept only an unambiguous standalone 'yes' (case-insensitive, ignoring
+    surrounding whitespace, quotes, and trailing punctuation). Empty, mixed, or
+    qualified responses count as no."""
+    if not text:
+        return False
+    t = text.strip().strip('"').strip("'").strip()
+    t = t.rstrip(".!?。").strip()
+    return t.lower() == "yes"
 
 
 # -- API --
@@ -129,13 +150,20 @@ def chat_completion(api_url, api_key, model, messages):
 
 
 # -- Prompt builders --
+# Faithful to the proven message structures from the successful P3 and P6 runs.
+# Key design choices validated across all 6 accepted solutions:
+# - Correction uses multi-turn (user/assistant/user) so the model sees its own
+#   previous solution as context and can fix specific issues.
+# - Verifier puts all instructions in the user message with a minimal system
+#   prompt, matching the P3 proven structure.
+# - Classifier uses strict standalone "yes" detection.
 
 DNL = "\n\n"
 DIV = "\n" + "=" * 70 + "\n"
 
 
 def build_solver_messages(problem):
-    user = DIV + "### Problem ###" + DNL + problem.strip()
+    user = problem.strip() + PRESENTATION_LIMIT_NOTE
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": user},
@@ -143,10 +171,9 @@ def build_solver_messages(problem):
 
 
 def build_self_improvement_messages(problem, solution):
-    user = DIV + "### Problem ###" + DNL + problem.strip()
     return [
         {"role": "system", "content": step1_prompt.strip()},
-        {"role": "user", "content": user},
+        {"role": "user", "content": problem.strip()},
         {"role": "assistant", "content": solution},
         {"role": "user", "content": self_improvement_prompt.strip()},
     ]
@@ -166,12 +193,13 @@ def build_verifier_messages(problem, solution):
     if not detailed:
         detailed = solution.strip()
     user = (
-        DIV + "### Problem ###" + DNL + problem.strip() + DNL
+        verification_system_prompt.strip() + DNL
+        + DIV + "### Problem ###" + DNL + problem.strip() + DNL
         + DIV + "### Solution ###" + DNL + detailed + DNL
         + verification_reminder.strip()
     )
     return [
-        {"role": "system", "content": verification_system_prompt.strip()},
+        {"role": "system", "content": "You are an expert IMO grader. Follow the instructions exactly."},
         {"role": "user", "content": user},
     ]
 
@@ -185,15 +213,12 @@ def build_correction_messages(problem, solution, verification):
     bug_report = extract_section(verification, "Detailed Verification", after=False)
     if not bug_report:
         bug_report = verification.strip()
-    user = (
-        DIV + "### Problem ###" + DNL + problem.strip() + DNL
-        + DIV + "### Current Solution ###" + DNL + solution.strip() + DNL
-        + correction_prompt.strip() + DNL
-        + DIV + "### Bug Report ###" + DNL + bug_report.strip()
-    )
+    user2 = correction_prompt.strip() + DNL + DIV + "### Bug Report ###" + DNL + bug_report.strip()
     return [
         {"role": "system", "content": step1_prompt.strip()},
-        {"role": "user", "content": user},
+        {"role": "user", "content": problem.strip()},
+        {"role": "assistant", "content": solution},
+        {"role": "user", "content": user2},
     ]
 
 
@@ -216,7 +241,21 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
         total_tokens += tokens
         log_progress(run_dir, f"RUN {outer_run} {label}: {tokens} tokens finish={finish}")
         if finish == "length":
-            log_progress(run_dir, f"RUN {outer_run} {label}: WARNING truncated (max_tokens)")
+            log_progress(run_dir, f"RUN {outer_run} {label}: truncated, neutral retry")
+            retry_messages = list(messages) + [
+                {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
+            ]
+            content2, usage2, finish2 = chat_completion(
+                api_url, api_key, model, retry_messages
+            )
+            tokens2 = usage2.get("total_tokens", 0)
+            total_tokens += tokens2
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} {label}: retry {tokens2} tokens finish={finish2}",
+            )
+            if content2.strip():
+                return content2
         return content
 
     # -- SOLVE --
@@ -244,9 +283,9 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
 
     good_verify = classification
     error_count = 0
-    correct_count = 1  # matches agent.py: initial pass counts as 1
+    correct_count = 1 if is_standalone_yes(good_verify) else 0
 
-    if "yes" in good_verify.lower():
+    if is_standalone_yes(good_verify):
         pass_artifacts.append({
             "candidate": f"candidate_{candidate_num:02d}.md",
             "verify": f"verify_{verify_num - 1:02d}.md",
@@ -267,7 +306,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
             "status": "running",
         })
 
-        if "yes" not in good_verify.lower():
+        if not is_standalone_yes(good_verify):
             correct_count = 0
             error_count += 1
             pass_artifacts.clear()
@@ -302,7 +341,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
 
         good_verify = classification
 
-        if "yes" in good_verify.lower():
+        if is_standalone_yes(good_verify):
             correct_count += 1
             error_count = 0
             pass_artifacts.append({
@@ -481,4 +520,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
