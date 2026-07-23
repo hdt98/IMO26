@@ -33,7 +33,8 @@ Never print or persist the token. Extract it at runtime without exposing values.
 
 The orchestrator encodes proven defaults: max_tokens=256000,
 thinking_budget=200000, HTTP_TIMEOUT=3600, MAX_TRANSPORT_RETRIES=3,
-MAX_ERRORS=3 (consecutive failures before run restart), REQUIRED_PASSES=5.
+MAX_ERRORS=3 (consecutive failures before run restart), REQUIRED_PASSES=5,
+WALL_CLOCK_TIMEOUT=5400 (90 minutes per API call).
 
 ## Launch (exec_command - no screen)
 
@@ -108,12 +109,20 @@ happened in memory and will be reflected in the next state.json save.
 The orchestrator has two built-in protections that work without agent
 intervention:
 
-1. Wall-clock timeout: signal.alarm fires after 3600 seconds (1 hour)
+1. Wall-clock timeout: signal.alarm fires after 5400 seconds (90 minutes)
    per API call, regardless of server keepalive. If the server sends
    partial data that prevents the HTTP read timeout from firing, the
    alarm still triggers, causing a retry. No external watchdog needed.
 
-2. Pivot mechanism: after 3 consecutive verification failures
+2. Three-tier classifier: the classifier outputs "yes" (clean pass),
+   "improve" (minor gaps, conclusion valid - triggers non-destructive
+   refinement without resetting pass count), or "no" (critical error -
+   triggers destructive correction).
+
+3. Tolerance: first "no" after passes triggers a re-verify before
+   destructive correction, handling stochastic false negatives.
+
+4. Pivot mechanism: after 3 consecutive verification failures
    (MAX_ERRORS=3), the current run fails and a new outer run starts
    with a fresh SOLVE. The solver prompt includes a PIVOT_HINT on
    outer_run > 1, telling the model to try a fundamentally different
