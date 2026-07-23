@@ -108,4 +108,8 @@ verification_reminder = """
 Your task is to act as an IMO grader. Now, generate the **summary** and the **step-by-step verification log** for the solution above. In your log, justify each correct step and explain in detail any errors or justification gaps you find, as specified in the instructions above.
 """
 
-classifier_prompt = 'Response in "yes" or "no". Is the following statement saying the solution is correct, or does not contain critical error or a major justification gap?'
+classifier_prompt = 'Response in "yes", "improve", or "no". Is the following verification saying the solution is correct ("yes"), has only minor justification gaps that do not invalidate the conclusion ("improve"), or has a critical error or major justification gap that invalidates the solution ("no")?'
+
+refinement_prompt = """
+Below is the verification report. The solution is fundamentally correct but has minor justification gaps. Please close these gaps while keeping the same approach and structure. Do not change the main argument or introduce new techniques. Your refined solution should strictly follow the instructions in the system prompt.
+"""

@@ -40,6 +40,7 @@ from prompts import (
     verification_system_prompt,
     verification_reminder,
     classifier_prompt,
+    refinement_prompt,
 )
 
 # -- Constants --
@@ -63,7 +64,7 @@ MAX_TRANSPORT_RETRIES = 3
 # signal.alarm fires regardless of what the server sends.
 # Set to 3600 (same as HTTP_TIMEOUT) so legitimate long-running calls
 # are unaffected - only truly stuck processes are caught.
-WALL_CLOCK_TIMEOUT = 3600  # max wall-clock per API call
+WALL_CLOCK_TIMEOUT = 5400  # max wall-clock per API call (90 min)
 
 
 class _WallClockTimeout(Exception):
@@ -133,10 +134,19 @@ def is_standalone_yes(text):
     t = t.rstrip(".!?。").strip()
     return t.lower() == "yes"
 
+def is_standalone_improve(text):
+    """Accept only an unambiguous standalone 'improve' (same normalization as
+    is_standalone_yes)."""
+    if not text:
+        return False
+    t = text.strip().strip('"').strip("'").strip()
+    t = t.rstrip(".!?。").strip()
+    return t.lower() == "improve"
+
 
 # -- API --
 
-def chat_completion(api_url, api_key, model, messages):
+def chat_completion(api_url, api_key, model, messages, log_fn=None):
     """Return (content, usage, finish_reason) from an OpenAI-compatible call.
 
     The GLM-5.2-FP8 endpoint supports Anthropic-style thinking via the
@@ -180,7 +190,12 @@ def chat_completion(api_url, api_key, model, messages):
         except Exception as exc:
             last_error = exc
             if attempt < MAX_TRANSPORT_RETRIES:
+                if log_fn:
+                    log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, retrying")
                 time.sleep(5 * attempt)
+            else:
+                if log_fn:
+                    log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, no retries left")
     raise RuntimeError(
         f"API call failed after {MAX_TRANSPORT_RETRIES} attempts: {last_error}"
     )
@@ -199,10 +214,11 @@ DNL = "\n\n"
 DIV = "\n" + "=" * 70 + "\n"
 
 
-def build_solver_messages(problem, outer_run=1):
+def build_solver_messages(problem, outer_run=1, pivot_hint=None):
     user = problem.strip() + PRESENTATION_LIMIT_NOTE
     if outer_run > 1:
-        user += chr(10) + chr(10) + PIVOT_HINT
+        hint = pivot_hint if pivot_hint else PIVOT_HINT
+        user += chr(10) + chr(10) + hint
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": user},
@@ -261,9 +277,38 @@ def build_correction_messages(problem, solution, verification):
     ]
 
 
+def build_refinement_messages(problem, solution, verification):
+    bug_report = extract_section(verification, "Detailed Verification", after=False)
+    if not bug_report:
+        bug_report = verification.strip()
+    user2 = refinement_prompt.strip() + DNL + DIV + "### Verification Report ###" + DNL + bug_report.strip()
+    return [
+        {"role": "system", "content": step1_prompt.strip()},
+        {"role": "user", "content": problem.strip()},
+        {"role": "assistant", "content": solution},
+        {"role": "user", "content": user2},
+    ]
+
+
 # -- Solver loop --
 
-def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
+def extract_failure_reason(verification):
+    """Extract a brief failure reason from the verification text."""
+    summary = extract_section(verification, "Final Verdict", after=True)
+    if not summary:
+        summary = verification.strip()[:300]
+    return summary[:200].strip()
+
+
+def build_pivot_hint(failure_reason=None):
+    """Build a dynamic pivot hint, optionally including failure reason."""
+    hint = PIVOT_HINT
+    if failure_reason:
+        hint += chr(10) + chr(10) + "Previous failure reason: " + failure_reason
+    return hint
+
+
+def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure_reason=None):
     """Run one outer attempt. Returns (accepted, candidate, summary)."""
     subdir = run_dir / f"run_{outer_run:02d}"
     subdir.mkdir(exist_ok=True)
@@ -275,7 +320,9 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
 
     def call(messages, label):
         nonlocal total_tokens
-        content, usage, finish = chat_completion(api_url, api_key, model, messages)
+        def log_fn(msg):
+            log_progress(run_dir, f"RUN {outer_run} {label}: {msg}")
+        content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn)
         tokens = usage.get("total_tokens", 0)
         total_tokens += tokens
         log_progress(run_dir, f"RUN {outer_run} {label}: {tokens} tokens finish={finish}")
@@ -285,7 +332,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
                 {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
             ]
             content2, usage2, finish2 = chat_completion(
-                api_url, api_key, model, retry_messages
+                api_url, api_key, model, retry_messages, log_fn=log_fn
             )
             tokens2 = usage2.get("total_tokens", 0)
             total_tokens += tokens2
@@ -299,7 +346,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
 
     # -- SOLVE --
     log_progress(run_dir, f"RUN {outer_run} SOLVE: start")
-    solution = call(build_solver_messages(problem, outer_run), "SOLVE")
+    pivot_hint = build_pivot_hint(prev_failure_reason) if outer_run > 1 else None
+    solution = call(build_solver_messages(problem, outer_run, pivot_hint), "SOLVE")
     save_text(subdir, "draft.md", solution)
 
     # -- SELF-IMPROVE --
@@ -323,6 +371,9 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
     good_verify = classification
     error_count = 0
     correct_count = 1 if is_standalone_yes(good_verify) else 0
+    consecutive_no = 0
+    last_good_candidate = candidate if correct_count > 0 else None
+    last_failure_reason = None
 
     if is_standalone_yes(good_verify):
         pass_artifacts.append({
@@ -331,10 +382,14 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
             "classify": f"classify_{verify_num - 1:02d}.md",
         })
         log_progress(run_dir, f"RUN {outer_run} initial PASS (1/{REQUIRED_PASSES})")
+    elif is_standalone_improve(good_verify):
+        log_progress(run_dir, f"RUN {outer_run} initial IMPROVE (minor gaps)")
     else:
+        consecutive_no = 1
+        last_failure_reason = extract_failure_reason(verification)
         log_progress(run_dir, f"RUN {outer_run} initial FAIL (errors=0)")
 
-    # -- CORRECT / VERIFY / CLASSIFY loop --
+    # -- REFINE / CORRECT / VERIFY / CLASSIFY loop --
     for i in range(MAX_ITERATIONS):
         save_state(run_dir, {
             "outer_run": outer_run,
@@ -345,21 +400,46 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
             "status": "running",
         })
 
-        if not is_standalone_yes(good_verify):
-            correct_count = 0
-            error_count += 1
-            pass_artifacts.clear()
-
+        # Decide action based on previous classification
+        if is_standalone_yes(good_verify):
+            # Pass - re-verify same candidate (no modification)
+            pass
+        elif is_standalone_improve(good_verify):
+            # Improve - non-destructive refinement to close minor gaps
             log_progress(
                 run_dir,
-                f"RUN {outer_run} ITER {i+1} CORRECT: start (errors={error_count})",
+                f"RUN {outer_run} ITER {i+1} REFINE: start (closing minor gaps)",
             )
             candidate = call(
-                build_correction_messages(problem, candidate, verification),
-                f"ITER {i+1} CORRECT",
+                build_refinement_messages(problem, candidate, verification),
+                f"ITER {i+1} REFINE",
             )
             candidate_num += 1
             save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
+        else:
+            # No - check tolerance before destructive correction
+            if correct_count > 0 and consecutive_no == 1:
+                # Tolerance: first no after passes, re-verify before correcting
+                log_progress(
+                    run_dir,
+                    f"RUN {outer_run} ITER {i+1} TOLERANCE: re-verifying (passes={correct_count})",
+                )
+            else:
+                # Destructive correction with fallback to last good candidate
+                correct_count = 0
+                error_count += 1
+                pass_artifacts.clear()
+                base = last_good_candidate if last_good_candidate else candidate
+                log_progress(
+                    run_dir,
+                    f"RUN {outer_run} ITER {i+1} CORRECT: start (errors={error_count})",
+                )
+                candidate = call(
+                    build_correction_messages(problem, base, verification),
+                    f"ITER {i+1} CORRECT",
+                )
+                candidate_num += 1
+                save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
 
         # VERIFY
         log_progress(run_dir, f"RUN {outer_run} ITER {i+1} VERIFY: start")
@@ -380,9 +460,12 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
 
         good_verify = classification
 
+        # Update counters based on new classification
         if is_standalone_yes(good_verify):
             correct_count += 1
             error_count = 0
+            consecutive_no = 0
+            last_good_candidate = candidate
             pass_artifacts.append({
                 "candidate": f"candidate_{candidate_num:02d}.md",
                 "verify": f"verify_{verify_num - 1:02d}.md",
@@ -392,7 +475,16 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
                 run_dir,
                 f"RUN {outer_run} ITER {i+1} PASS ({correct_count}/{REQUIRED_PASSES})",
             )
+        elif is_standalone_improve(good_verify):
+            error_count = 0
+            consecutive_no = 0
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} ITER {i+1} IMPROVE ({correct_count}/{REQUIRED_PASSES})",
+            )
         else:
+            consecutive_no += 1
+            last_failure_reason = extract_failure_reason(verification)
             log_progress(
                 run_dir,
                 f"RUN {outer_run} ITER {i+1} FAIL "
@@ -417,6 +509,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
                 "total_tokens": total_tokens,
                 "pass_artifacts": pass_artifacts,
                 "iterations": i + 1,
+                "failure_reason": last_failure_reason,
             }
 
         if error_count >= MAX_ERRORS:
@@ -432,7 +525,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
                 "accepted": False,
                 "status": "failed",
             })
-            return False, None, {"total_tokens": total_tokens}
+            return False, None, {"total_tokens": total_tokens, "failure_reason": last_failure_reason}
 
     log_progress(
         run_dir, f"RUN {outer_run} EXHAUSTED: {MAX_ITERATIONS} iterations"
@@ -445,7 +538,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir):
         "accepted": False,
         "status": "exhausted",
     })
-    return False, None, {"total_tokens": total_tokens}
+    return False, None, {"total_tokens": total_tokens, "failure_reason": last_failure_reason}
 
 
 # -- Main --
@@ -490,6 +583,7 @@ def main():
         f"ORCHESTRATOR START: problem={args.problem.name} model={args.model}",
     )
 
+    last_failure_reason = None
     for outer_run in range(1, MAX_OUTER_RUNS + 1):
         log_progress(args.run_dir, f"OUTER_RUN {outer_run}/{MAX_OUTER_RUNS}")
         save_state(args.run_dir, {
@@ -505,6 +599,7 @@ def main():
                 args.api_key,
                 args.model,
                 args.run_dir,
+                prev_failure_reason=last_failure_reason,
             )
         except Exception as exc:
             log_progress(args.run_dir, f"RUN {outer_run} ERROR: {exc}")
@@ -515,6 +610,9 @@ def main():
                 "error": str(exc),
             })
             continue
+
+        if not accepted and summary and summary.get("failure_reason"):
+            last_failure_reason = summary["failure_reason"]
 
         if accepted:
             args.output.parent.mkdir(parents=True, exist_ok=True)
