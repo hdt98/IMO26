@@ -19,14 +19,7 @@ configured model endpoint. It reads credentials from command-line flags:
 - --api-key  - bearer token
 - --model    - model name
 
-Two endpoints are available. Choose one and use its matching token:
-
-  Cloud endpoint (from Claude settings):
-    - API URL: ~/.claude/settings.json env "ANTHROPIC_BASE_URL" + /chat/completions
-    - Token: ~/.claude/settings.json env "ANTHROPIC_AUTH_TOKEN"
-    - Model: ~/.claude/settings.json env "ANTHROPIC_MODEL"
-
-  Direct IP endpoint:
+Direct IP endpoint:
     - API URL: http://165.245.166.41:30000/v1/chat/completions
     - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
     - Model: GLM-5.2-FP8
@@ -34,7 +27,7 @@ Two endpoints are available. Choose one and use its matching token:
 Never print or persist the token in source files.
 
 The orchestrator already encodes max_tokens=256000 with thinking_budget=200000,
-a 3600-second HTTP timeout, a 3600-second wall-clock timeout (signal.alarm),
+a 5400-second HTTP timeout, a 5400-second wall-clock timeout (signal.alarm),
 and no more than three transport retries. These values are proven from
 the P3 run: the solver used 124650 reasoning tokens out of the 200000 budget
 and completed normally with finish_reason=stop.
@@ -126,7 +119,7 @@ happened in memory and will be reflected in the next state.json save.
 The orchestrator has two built-in protections that work without agent
 intervention:
 
-1. Wall-clock timeout: signal.alarm fires after 3600 seconds (1 hour)
+1. Wall-clock timeout: signal.alarm fires after 5400 seconds (90 minutes)
    per API call, regardless of server keepalive. If the server sends
    partial data that prevents the HTTP read timeout from firing, the
    alarm still triggers, causing a retry. No external watchdog needed.
@@ -204,7 +197,7 @@ generating long inline analysis.
 
 The Anthropic SDK's default timeout is 600000ms (10 minutes) for non-streaming
 API requests. This does NOT affect the orchestrator, which makes its own API
-calls directly to the model endpoint with a 3600-second timeout. Claude Code
+calls directly to the model endpoint with a 5400-second timeout. Claude Code
 uses streaming with API_TIMEOUT_MS=3000000 (50 minutes), so its own API calls
 are not affected either. The 600000ms timeout is NOT a blocker for this
 workflow.

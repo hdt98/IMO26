@@ -17,14 +17,7 @@ configured model endpoint. Always pass --api-url, --api-key, and --model
 explicitly as command-line arguments. Do not rely on environment variable
 inheritance.
 
-Two endpoints are available. Choose one and use its matching token:
-
-  Cloud endpoint (from Codex config):
-    - API URL: ~/.codex/config.toml [model_providers.custom] base_url + /chat/completions
-    - Token: ~/.codex/auth.json key "OPENAI_API_KEY"
-    - Model: ~/.codex/config.toml top-level "model"
-
-  Direct IP endpoint:
+Direct IP endpoint:
     - API URL: http://165.245.166.41:30000/v1/chat/completions
     - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
     - Model: GLM-5.2-FP8
@@ -154,8 +147,9 @@ When the orchestrator finishes (write_stdin returns exit_code), the
 process has already exited and the session is automatically closed.
 No manual cleanup is needed.
 
-If the goal is stopped mid-flight, the Codex framework kills the
-exec_command child process automatically. No orphaned processes remain.
+If the goal is stopped mid-flight, the orchestrator process may survive
+as an orphan. Run scripts/cleanup.sh to identify and kill stale processes
+before starting a new run.
 
 To identify stale processes from other sessions:
     bash scripts/cleanup.sh

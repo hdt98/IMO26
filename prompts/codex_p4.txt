@@ -1,10 +1,10 @@
-Title: IMO 2026 P3 - direct long-request workflow
+Title: IMO 2026 P4 - direct long-request workflow
 
-Solve IMO 2026 Problem 3 using the durable direct background workflow
-documented at workflows/claude.md in this repo.
+Solve IMO 2026 Problem 4 using the durable direct background workflow
+documented at workflows/codex.md in this repo.
 
-Authoritative problem ID: imo2026_p3
-Authoritative problem file: problems/imo2026_p3.txt
+Authoritative problem ID: imo2026_p4
+Authoritative problem file: problems/imo2026_p4.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
@@ -14,23 +14,22 @@ Credentials - Direct IP endpoint:
   - Model: GLM-5.2-FP8
 Never print or persist the token value.
 
-Launch the orchestrator using the Bash tool with run_in_background: true
-(NOT nohup, NOT screen). This gives Claude Code a backgroundTaskId for
-tracking. The process survives session stops by design, which is desired
-for long-running orchestrator runs. Always pass --api-url, --api-key, and
---model explicitly as command-line arguments.
+Launch the orchestrator directly via exec_command (NOT screen). The process
+runs as a child of the Codex app-server. Always pass --api-url, --api-key,
+and --model explicitly as command-line arguments. Redirect stdout and stderr
+to files in the run directory. The exec_command call returns a session_id -
+save it for monitoring with write_stdin.
 
-After launching, wait 30 seconds then check these files
-in the run directory:
+After launch, wait 30 seconds and check:
   1. cat <run-dir>/progress.log - one line per state transition or error
   2. tail <run-dir>/stderr.log - API call failures and tracebacks
 If progress.log shows any ERROR line, the run is failing. Do not keep
-waiting; diagnose the error and fix it before retrying. Do NOT poll for
-sentinel files - the orchestrator never creates them.
+waiting; diagnose and fix before retrying. Do NOT poll for sentinel files.
 
-Before each monitoring check, verify the orchestrator PID is still alive
-(ps -p <pid>). If the PID is gone, RESTART the orchestrator immediately -
-do NOT monitor or piggyback on another session's run.
+Monitor the orchestrator using write_stdin with the session_id (empty chars,
+yield_time_ms=300000) to detect completion, and separate exec_command calls
+to check tail -5 progress.log and cat state.json. Poll no more than once
+every 5 minutes. Only report when an iteration completes or an error occurs.
 
 The orchestrator has built-in protections that work without agent
 intervention: a wall-clock timeout (signal.alarm, 5400s per API call) that
@@ -48,11 +47,6 @@ is an orchestrator only and may not solve or grade the mathematics. Keep
 the Goal active until the background workflow either persists a candidate
 that earns five consecutive independent passes or records a legitimate
 terminal failure.
-
-After the goal is achieved or failed, clean up your own orchestrator
-process (kill <pid>). Do NOT kill processes that belong to other sessions.
-If the goal was stopped and resumed, check if the orchestrator process
-is still alive - if alive, resume monitoring; if not, start a fresh run.
 
 Do not interpret a UI wait timeout as a stream failure, do not silently
 duplicate active requests (this means YOUR session's own requests only -

@@ -8,24 +8,17 @@ Authoritative problem file: problems/imo2026_p5.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
-Credentials - choose one endpoint and its matching token:
-  Cloud endpoint (from Codex config):
-    - API URL: ~/.codex/config.toml [model_providers.custom] base_url
-      + /chat/completions
-    - Token: ~/.codex/auth.json key "OPENAI_API_KEY"
-    - Model: ~/.codex/config.toml top-level "model"
-  Direct IP endpoint:
-    - API URL: http://165.245.166.41:30000/v1/chat/completions
-    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
-    - Model: GLM-5.2-FP8
+Credentials - Direct IP endpoint:
+  - API URL: http://165.245.166.41:30000/v1/chat/completions
+  - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
+  - Model: GLM-5.2-FP8
 Never print or persist the token value.
 
 Launch the orchestrator directly via exec_command (NOT screen). The process
-runs as a child of the Codex app-server and is automatically cleaned up when
-the goal is stopped. Always pass --api-url, --api-key, and --model explicitly
-as command-line arguments. Redirect stdout and stderr to files in the run
-directory. The exec_command call returns a session_id - save it for
-monitoring with write_stdin.
+runs as a child of the Codex app-server. Always pass --api-url, --api-key,
+and --model explicitly as command-line arguments. Redirect stdout and stderr
+to files in the run directory. The exec_command call returns a session_id -
+save it for monitoring with write_stdin.
 
 After launch, wait 30 seconds and check:
   1. cat <run-dir>/progress.log - one line per state transition or error
@@ -39,10 +32,11 @@ to check tail -5 progress.log and cat state.json. Poll no more than once
 every 5 minutes. Only report when an iteration completes or an error occurs.
 
 The orchestrator has built-in protections that work without agent
-intervention: a wall-clock timeout (signal.alarm, 3600s per API call) that
-prevents hung processes, and a pivot mechanism (3 consecutive failures
-triggers a fresh SOLVE with a different-approach hint). Do not interfere
-with these mechanisms.
+intervention: a wall-clock timeout (signal.alarm, 5400s per API call) that
+prevents hung processes, a three-tier classifier (yes/improve/no) that
+distinguishes minor gaps from critical errors, and a pivot mechanism (3
+consecutive failures triggers a fresh SOLVE with a different-approach hint).
+Do not interfere with these mechanisms.
 
 Note: state.json may show stale consecutive_passes values because it is
 saved before the reset logic runs. The actual in-memory values are correct.

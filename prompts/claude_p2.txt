@@ -8,16 +8,10 @@ Authoritative problem file: problems/imo2026_p2.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
-Credentials - choose one endpoint and its matching token:
-  Cloud endpoint (from Claude settings):
-    - API URL: ~/.claude/settings.json env "ANTHROPIC_BASE_URL"
-      + /chat/completions
-    - Token: ~/.claude/settings.json env "ANTHROPIC_AUTH_TOKEN"
-    - Model: ~/.claude/settings.json env "ANTHROPIC_MODEL"
-  Direct IP endpoint:
-    - API URL: http://165.245.166.41:30000/v1/chat/completions
-    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
-    - Model: GLM-5.2-FP8
+Credentials - Direct IP endpoint:
+  - API URL: http://165.245.166.41:30000/v1/chat/completions
+  - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
+  - Model: GLM-5.2-FP8
 Never print or persist the token value.
 
 Launch the orchestrator using the Bash tool with run_in_background: true
@@ -39,10 +33,11 @@ Before each monitoring check, verify the orchestrator PID is still alive
 do NOT monitor or piggyback on another session's run.
 
 The orchestrator has built-in protections that work without agent
-intervention: a wall-clock timeout (signal.alarm, 3600s per API call) that
-prevents hung processes, and a pivot mechanism (3 consecutive failures
-triggers a fresh SOLVE with a different-approach hint). Do not interfere
-with these mechanisms.
+intervention: a wall-clock timeout (signal.alarm, 5400s per API call) that
+prevents hung processes, a three-tier classifier (yes/improve/no) that
+distinguishes minor gaps from critical errors, and a pivot mechanism (3
+consecutive failures triggers a fresh SOLVE with a different-approach hint).
+Do not interfere with these mechanisms.
 
 Note: state.json may show stale consecutive_passes values because it is
 saved before the reset logic runs. The actual in-memory values are correct.
