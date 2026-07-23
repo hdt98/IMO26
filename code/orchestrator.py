@@ -56,6 +56,8 @@ MAX_TOKENS = 256_000
 THINKING_BUDGET = 200_000
 HTTP_TIMEOUT = 5400
 MAX_TRANSPORT_RETRIES = 3
+MAX_INFRA_RETRIES = 5  # consecutive infra errors before giving up
+INFRA_BACKOFF_BASE = 30  # seconds, doubled each consecutive infra error
 
 # Wall-clock timeout per API call. Python requests timeout is a read
 # timeout (time between bytes received), not a total timeout. Server
@@ -69,6 +71,12 @@ WALL_CLOCK_TIMEOUT = 5400  # max wall-clock per API call (90 min)
 
 class _WallClockTimeout(Exception):
     """Raised when signal.alarm fires during an API call."""
+
+
+class InfrastructureError(Exception):
+    """Raised when the API endpoint is unreachable (connection refused, DNS
+    failure, etc.). Distinct from model errors (wrong answer) so the caller
+    can wait with backoff instead of burning through outer runs."""
 
 
 def _alarm_handler(signum, frame):
@@ -187,6 +195,21 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
             usage = data.get("usage", {})
             finish = choice.get("finish_reason", "unknown")
             return content, usage, finish
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_error = exc
+            is_conn_error = isinstance(exc, requests.exceptions.ConnectionError)
+            if attempt < MAX_TRANSPORT_RETRIES:
+                backoff = INFRA_BACKOFF_BASE * (2 ** (attempt - 1)) if is_conn_error else 5 * attempt
+                if log_fn:
+                    log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, retrying in {backoff}s")
+                time.sleep(backoff)
+            else:
+                if log_fn:
+                    log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, no retries left")
+                if is_conn_error:
+                    raise InfrastructureError(
+                        f"Endpoint unreachable after {MAX_TRANSPORT_RETRIES} attempts: {last_error}"
+                    ) from last_error
         except Exception as exc:
             last_error = exc
             if attempt < MAX_TRANSPORT_RETRIES:
@@ -571,11 +594,33 @@ def main():
     problem = args.problem.read_text(encoding="utf-8")
     args.run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pre-launch duplicate detection: check if another orchestrator is
+    # already running for the same output file.
+    lock_file = args.output.with_suffix(args.output.suffix + ".lock")
+    if lock_file.exists():
+        try:
+            old_pid = int(lock_file.read_text().strip())
+            try:
+                os.kill(old_pid, 0)
+                print(
+                    f"ERROR: Another orchestrator (PID {old_pid}) is already "
+                    f"running for {args.output}. Refusing to duplicate.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            except (ProcessLookupError, PermissionError):
+                pass  # PID is dead, take over the lock
+        except (ValueError, OSError):
+            pass  # Corrupt lock file, take over
+
+    lock_file.write_text(str(os.getpid()), encoding="utf-8")
+
     if (args.run_dir / "state.json").exists():
         print(
             f"ERROR: run directory already has state.json: {args.run_dir}",
             file=sys.stderr,
         )
+        lock_file.unlink(missing_ok=True)
         sys.exit(1)
 
     log_progress(
@@ -584,6 +629,7 @@ def main():
     )
 
     last_failure_reason = None
+    consecutive_infra_errors = 0
     for outer_run in range(1, MAX_OUTER_RUNS + 1):
         log_progress(args.run_dir, f"OUTER_RUN {outer_run}/{MAX_OUTER_RUNS}")
         save_state(args.run_dir, {
@@ -601,6 +647,39 @@ def main():
                 args.run_dir,
                 prev_failure_reason=last_failure_reason,
             )
+            consecutive_infra_errors = 0
+        except InfrastructureError as exc:
+            consecutive_infra_errors += 1
+            backoff = INFRA_BACKOFF_BASE * (2 ** consecutive_infra_errors)
+            log_progress(
+                args.run_dir,
+                f"RUN {outer_run} INFRA_ERROR ({consecutive_infra_errors}/{MAX_INFRA_RETRIES}): {exc}, "
+                f"waiting {backoff}s before next run",
+            )
+            save_state(args.run_dir, {
+                "outer_run": outer_run,
+                "status": "infra_error",
+                "error": str(exc),
+                "consecutive_infra_errors": consecutive_infra_errors,
+            })
+            if consecutive_infra_errors >= MAX_INFRA_RETRIES:
+                log_progress(
+                    args.run_dir,
+                    f"ENDPOINT_UNAVAILABLE: {MAX_INFRA_RETRIES} consecutive infrastructure errors",
+                )
+                save_state(args.run_dir, {
+                    "outer_run": outer_run,
+                    "status": "endpoint_unavailable",
+                })
+                lock_file.unlink(missing_ok=True)
+                print(
+                    f"Endpoint unavailable after {MAX_INFRA_RETRIES} consecutive errors.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            time.sleep(backoff)
+            # Retry the same outer run instead of advancing
+            continue
         except Exception as exc:
             log_progress(args.run_dir, f"RUN {outer_run} ERROR: {exc}")
             traceback.print_exc()
@@ -638,6 +717,7 @@ def main():
                 f"sha256={manifest['sha256'][:16]}...",
             )
             print(f"Solution accepted: {args.output}")
+            lock_file.unlink(missing_ok=True)
             sys.exit(0)
 
     log_progress(
@@ -652,6 +732,7 @@ def main():
         f"No verified solution found after {MAX_OUTER_RUNS} runs.",
         file=sys.stderr,
     )
+    lock_file.unlink(missing_ok=True)
     sys.exit(1)
 
 
