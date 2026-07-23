@@ -173,7 +173,7 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
         "messages": messages,
         "max_tokens": MAX_TOKENS,
         "thinking": {"type": "enabled", "budget_tokens": THINKING_BUDGET},
-        "stream": False,
+        "stream": True,
     }
     last_error = None
     for attempt in range(1, MAX_TRANSPORT_RETRIES + 1):
@@ -182,18 +182,48 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
             signal.alarm(WALL_CLOCK_TIMEOUT)
             try:
                 resp = requests.post(
-                    api_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT
+                    api_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT,
+                    stream=True,
                 )
+                resp.raise_for_status()
+
+                # Parse SSE stream: accumulate content and capture usage +
+                # finish_reason from chunks. Streaming keeps the connection
+                # alive, preventing the server from closing it before the
+                # full response is generated.
+                content_parts = []
+                usage = {}
+                finish = "unknown"
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                    elif line.startswith("data:"):
+                        data_str = line[5:]
+                    else:
+                        continue
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if "usage" in chunk and chunk["usage"]:
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}) or {}
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                    fr = choices[0].get("finish_reason")
+                    if fr:
+                        finish = fr
+                content = "".join(content_parts)
             finally:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            msg = choice.get("message", {}) or {}
-            content = msg.get("content") or ""
-            usage = data.get("usage", {})
-            finish = choice.get("finish_reason", "unknown")
             return content, usage, finish
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_error = exc
