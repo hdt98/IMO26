@@ -124,7 +124,24 @@ intervention:
    partial data that prevents the HTTP read timeout from firing, the
    alarm still triggers, causing a retry. No external watchdog needed.
 
-2. Pivot mechanism: after 3 consecutive verification failures
+2. Infrastructure error detection: connection errors (endpoint down,
+   DNS failure) are detected separately from model errors. The
+   orchestrator waits with exponential backoff (30s, 60s, 120s) before
+   retrying, instead of burning through outer runs. After 5 consecutive
+   infrastructure errors, it terminates with ENDPOINT_UNAVAILABLE status.
+
+3. Duplicate run prevention: a lock file (<output>.lock) prevents two
+   orchestrators from running for the same problem simultaneously.
+
+4. Three-tier classifier: the classifier outputs "yes" (clean pass),
+   "improve" (minor gaps, conclusion valid - triggers non-destructive
+   refinement without resetting pass count), or "no" (critical error -
+   triggers destructive correction).
+
+5. Tolerance: first "no" after passes triggers a re-verify before
+   destructive correction, handling stochastic false negatives.
+
+6. Pivot mechanism: after 3 consecutive verification failures
    (MAX_ERRORS=3), the current run fails and a new outer run starts
    with a fresh SOLVE. The solver prompt includes a PIVOT_HINT on
    outer_run > 1, telling the model to try a fundamentally different

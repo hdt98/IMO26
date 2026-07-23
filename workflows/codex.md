@@ -25,15 +25,15 @@ Direct IP endpoint:
 Never print or persist the token. Extract it at runtime without exposing values.
 
 The orchestrator encodes proven defaults: max_tokens=256000,
-thinking_budget=200000, HTTP_TIMEOUT=3600, MAX_TRANSPORT_RETRIES=3,
+thinking_budget=200000, HTTP_TIMEOUT=5400, MAX_TRANSPORT_RETRIES=3,
 MAX_ERRORS=3 (consecutive failures before run restart), REQUIRED_PASSES=5,
 WALL_CLOCK_TIMEOUT=5400 (90 minutes per API call).
 
 ## Launch (exec_command - no screen)
 
 Launch the orchestrator directly via exec_command. The process becomes a child
-of the Codex app-server, so it is automatically cleaned up when the goal is
-stopped or the app exits. No screen session is needed.
+of the Codex app-server. Stopping a goal may leave the orchestrator
+running as an orphan — run scripts/cleanup.sh to find stale processes.
 
 Run this command via exec_command (yield_time_ms=3000):
 
@@ -107,15 +107,25 @@ intervention:
    partial data that prevents the HTTP read timeout from firing, the
    alarm still triggers, causing a retry. No external watchdog needed.
 
-2. Three-tier classifier: the classifier outputs "yes" (clean pass),
+2. Infrastructure error detection: connection errors (endpoint down,
+   DNS failure) are detected separately from model errors. The
+   orchestrator waits with exponential backoff (30s, 60s, 120s) before
+   retrying, instead of burning through outer runs. After 5 consecutive
+   infrastructure errors, it terminates with ENDPOINT_UNAVAILABLE status.
+
+3. Duplicate run prevention: a lock file (<output>.lock) prevents two
+   orchestrators from running for the same problem simultaneously. If
+   another orchestrator is already running, the new one refuses to start.
+
+4. Three-tier classifier: the classifier outputs "yes" (clean pass),
    "improve" (minor gaps, conclusion valid - triggers non-destructive
    refinement without resetting pass count), or "no" (critical error -
    triggers destructive correction).
 
-3. Tolerance: first "no" after passes triggers a re-verify before
+5. Tolerance: first "no" after passes triggers a re-verify before
    destructive correction, handling stochastic false negatives.
 
-4. Pivot mechanism: after 3 consecutive verification failures
+6. Pivot mechanism: after 3 consecutive verification failures
    (MAX_ERRORS=3), the current run fails and a new outer run starts
    with a fresh SOLVE. The solver prompt includes a PIVOT_HINT on
    outer_run > 1, telling the model to try a fundamentally different

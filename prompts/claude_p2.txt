@@ -34,9 +34,12 @@ do NOT monitor or piggyback on another session's run.
 
 The orchestrator has built-in protections that work without agent
 intervention: a wall-clock timeout (signal.alarm, 5400s per API call) that
-prevents hung processes, a three-tier classifier (yes/improve/no) that
-distinguishes minor gaps from critical errors, and a pivot mechanism (3
-consecutive failures triggers a fresh SOLVE with a different-approach hint).
+prevents hung processes, infrastructure error detection with exponential
+backoff (waits instead of burning through runs when endpoint is down), a
+lock file that prevents duplicate runs for the same problem, a three-tier
+classifier (yes/improve/no) that distinguishes minor gaps from critical
+errors, and a pivot mechanism (3 consecutive failures triggers a fresh
+SOLVE with a different-approach hint).
 Do not interfere with these mechanisms.
 
 Note: state.json may show stale consecutive_passes values because it is
