@@ -27,7 +27,8 @@ Never print or persist the token. Extract it at runtime without exposing values.
 The orchestrator encodes proven defaults: max_tokens=256000,
 thinking_budget=200000, HTTP_TIMEOUT=5400, MAX_TRANSPORT_RETRIES=3,
 MAX_ERRORS=3 (consecutive failures before run restart), REQUIRED_PASSES=5,
-WALL_CLOCK_TIMEOUT=5400 (90 minutes per API call).
+WALL_CLOCK_TIMEOUT=5400 (90 minutes per API call),
+CORRECT_MAX_TOKENS=128000 and CORRECT_THINKING_BUDGET=100000 for CORRECT/REFINE calls.
 
 The orchestrator uses streaming mode (stream=True) with SSE chunk parsing
 and stream_options={"include_usage": true} to capture token counts. Streaming
@@ -107,10 +108,10 @@ happened in memory and will be reflected in the next state.json save.
 The orchestrator has built-in protections that work without agent
 intervention:
 
-1. Wall-clock timeout: signal.alarm fires after 5400 seconds (90 minutes)
+1. Wall-clock timeout: threading.Timer fires after 5400 seconds (90 minutes)
    per API call, regardless of server keepalive. If the server sends
    partial data that prevents the HTTP read timeout from firing, the
-   alarm still triggers, causing a retry. No external watchdog needed.
+   timer still triggers, aborting the call without retry. The failed run is then treated as a regular failure, triggering the pivot mechanism if needed.
 
 2. Infrastructure error detection: connection errors (endpoint down,
    DNS failure) are detected separately from model errors. The

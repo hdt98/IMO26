@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -53,24 +54,24 @@ MAX_ERRORS = 3  # consecutive failures before run restarts (was 10)
 REQUIRED_PASSES = 5
 MAX_OUTER_RUNS = 10
 MAX_TOKENS = 256_000
+CORRECT_MAX_TOKENS = 128_000  # Gap 1+5: cap CORRECT/REFINE to prevent oversized outputs
 THINKING_BUDGET = 200_000
+CORRECT_THINKING_BUDGET = 100_000  # Gap 5: smaller thinking budget for corrections
 HTTP_TIMEOUT = 5400
 MAX_TRANSPORT_RETRIES = 3
 MAX_INFRA_RETRIES = 5  # consecutive infra errors before giving up
 INFRA_BACKOFF_BASE = 30  # seconds, doubled each consecutive infra error
 
-# Wall-clock timeout per API call. Python requests timeout is a read
-# timeout (time between bytes received), not a total timeout. Server
-# keepalive or partial data resets the read timer indefinitely, causing
-# processes to hang at 0% CPU forever (observed on P2 SOLVE). The
-# signal.alarm fires regardless of what the server sends.
-# Set to 5400 (same as HTTP_TIMEOUT) so legitimate long-running calls
-# are unaffected - only truly stuck processes are caught.
+# Wall-clock timeout per API call. Uses threading.Timer (not signal.alarm)
+# because signal.alarm delivery is delayed by 500+ seconds on macOS when the
+# main thread is blocked in a C extension (SSL recv) during streaming.
+# threading.Timer fires in a separate thread and checks timer.fired in the
+# SSE parsing loop, providing reliable timeout regardless of main thread state.
 WALL_CLOCK_TIMEOUT = 5400  # max wall-clock per API call (90 min)
 
 
 class _WallClockTimeout(Exception):
-    """Raised when signal.alarm fires during an API call."""
+    """Raised when the wall-clock timer fires during an API call."""
 
 
 class InfrastructureError(Exception):
@@ -79,11 +80,35 @@ class InfrastructureError(Exception):
     can wait with backoff instead of burning through outer runs."""
 
 
-def _alarm_handler(signum, frame):
-    raise _WallClockTimeout(
-        f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s "
-        "(server may be sending keepalive without real data)"
-    )
+class _WallClockTimer:
+    """Thread-based wall-clock timer. More reliable than signal.alarm on macOS
+    during streaming I/O, where signal delivery can be delayed by 500+ seconds
+    because the main thread is blocked in a C extension (SSL recv)."""
+    def __init__(self, timeout, log_fn=None):
+        self._timer = None
+        self._fired = False
+        self._timeout = timeout
+        self._log_fn = log_fn
+
+    def _fire(self):
+        self._fired = True
+        if self._log_fn:
+            self._log_fn(f"wall-clock timer fired after {self._timeout}s")
+
+    def start(self):
+        self._fired = False
+        self._timer = threading.Timer(self._timeout, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def cancel(self):
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+    @property
+    def fired(self):
+        return self._fired
 
 
 NEUTRAL_COMPLETE_REQUEST = (
@@ -154,7 +179,7 @@ def is_standalone_improve(text):
 
 # -- API --
 
-def chat_completion(api_url, api_key, model, messages, log_fn=None):
+def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=None, thinking_budget=None):
     """Return (content, usage, finish_reason) from an OpenAI-compatible call.
 
     The GLM-5.2-FP8 endpoint supports Anthropic-style thinking via the
@@ -171,16 +196,16 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": MAX_TOKENS,
-        "thinking": {"type": "enabled", "budget_tokens": THINKING_BUDGET},
+        "max_tokens": max_tokens if max_tokens else MAX_TOKENS,
+        "thinking": {"type": "enabled", "budget_tokens": thinking_budget if thinking_budget else THINKING_BUDGET},
         "stream": True,
         "stream_options": {"include_usage": True},
     }
     last_error = None
     for attempt in range(1, MAX_TRANSPORT_RETRIES + 1):
         try:
-            old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-            signal.alarm(WALL_CLOCK_TIMEOUT)
+            wc_timer = _WallClockTimer(WALL_CLOCK_TIMEOUT, log_fn=log_fn)
+            wc_timer.start()
             try:
                 resp = requests.post(
                     api_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT,
@@ -196,6 +221,11 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
                 usage = {}
                 finish = "unknown"
                 for line in resp.iter_lines(decode_unicode=True):
+                    if wc_timer.fired:
+                        raise _WallClockTimeout(
+                            f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s "
+                            "(server may be sending keepalive without real data)"
+                        )
                     if not line:
                         continue
                     if line.startswith("data: "):
@@ -223,8 +253,7 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
                         finish = fr
                 content = "".join(content_parts)
             finally:
-                signal.alarm(0)
-                signal.signal(signal.SIGALRM, old_handler)
+                wc_timer.cancel()
             return content, usage, finish
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_error = exc
@@ -241,6 +270,13 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
                     raise InfrastructureError(
                         f"Endpoint unreachable after {MAX_TRANSPORT_RETRIES} attempts: {last_error}"
                     ) from last_error
+        except _WallClockTimeout as exc:
+            # Do NOT retry on wall-clock timeout. The call took too long
+            # (server stall or oversized request). Retrying wastes another
+            # full timeout period. Let the caller handle it.
+            if log_fn:
+                log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} wall-clock timeout, not retrying")
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < MAX_TRANSPORT_RETRIES:
@@ -319,10 +355,11 @@ def build_classifier_messages(verification):
 
 
 def build_correction_messages(problem, solution, verification):
-    bug_report = extract_section(verification, "Detailed Verification", after=False)
-    if not bug_report:
-        bug_report = verification.strip()
-    user2 = correction_prompt.strip() + DNL + DIV + "### Bug Report ###" + DNL + bug_report.strip()
+    # Gap 7: Send the ENTIRE verification (Summary + Detailed Log) to the
+    # corrector, not just the Summary. The detailed log contains numerical
+    # counterexamples and step-by-step reasoning that the corrector needs.
+    bug_report = verification.strip()
+    user2 = correction_prompt.strip() + DNL + DIV + "### Full Verification Report ###" + DNL + bug_report
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": problem.strip()},
@@ -332,10 +369,9 @@ def build_correction_messages(problem, solution, verification):
 
 
 def build_refinement_messages(problem, solution, verification):
-    bug_report = extract_section(verification, "Detailed Verification", after=False)
-    if not bug_report:
-        bug_report = verification.strip()
-    user2 = refinement_prompt.strip() + DNL + DIV + "### Verification Report ###" + DNL + bug_report.strip()
+    # Gap 7: Send the ENTIRE verification to the refiner.
+    bug_report = verification.strip()
+    user2 = refinement_prompt.strip() + DNL + DIV + "### Full Verification Report ###" + DNL + bug_report
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": problem.strip()},
@@ -347,18 +383,33 @@ def build_refinement_messages(problem, solution, verification):
 # -- Solver loop --
 
 def extract_failure_reason(verification):
-    """Extract a brief failure reason from the verification text."""
-    summary = extract_section(verification, "Final Verdict", after=True)
-    if not summary:
-        summary = verification.strip()[:300]
-    return summary[:200].strip()
+    """Extract a failure reason from the verification text.
+    
+    Gets the Summary section (Final Verdict + List of Findings) which
+    contains the key information about what went wrong. The Detailed
+    Verification Log is excluded to keep the pivot hint concise.
+    """
+    # Try to get everything from "Final Verdict" to "Detailed Verification"
+    verdict = extract_section(verification, "Final Verdict", after=True)
+    if not verdict:
+        return verification.strip()[:500]
+    # Cut at "Detailed Verification" if present (only keep Summary)
+    idx = verdict.find("Detailed Verification")
+    if idx != -1:
+        verdict = verdict[:idx].strip()
+    return verdict[:500].strip()
 
 
 def build_pivot_hint(failure_reason=None):
-    """Build a dynamic pivot hint, optionally including failure reason."""
+    """Build a dynamic pivot hint, optionally including failure reason.
+    
+    Gap 2: failure_reason now includes accumulated reasons from all
+    failed iterations (up to last 3), giving the model more context
+    about what approaches didn't work.
+    """
     hint = PIVOT_HINT
     if failure_reason:
-        hint += chr(10) + chr(10) + "Previous failure reason: " + failure_reason
+        hint += chr(10) + chr(10) + "Previous failure reason(s): " + failure_reason
     return hint
 
 
@@ -372,11 +423,11 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     verify_num = 0
     pass_artifacts = []
 
-    def call(messages, label):
+    def call(messages, label, max_tokens=None, thinking_budget=None):
         nonlocal total_tokens
         def log_fn(msg):
             log_progress(run_dir, f"RUN {outer_run} {label}: {msg}")
-        content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn)
+        content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget)
         tokens = usage.get("total_tokens", 0)
         total_tokens += tokens
         log_progress(run_dir, f"RUN {outer_run} {label}: {tokens} tokens finish={finish}")
@@ -428,6 +479,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     consecutive_no = 0
     last_good_candidate = candidate if correct_count > 0 else None
     last_failure_reason = None
+    all_failure_reasons = []  # Gap 2: accumulate all failure reasons
 
     if is_standalone_yes(good_verify):
         pass_artifacts.append({
@@ -441,6 +493,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     else:
         consecutive_no = 1
         last_failure_reason = extract_failure_reason(verification)
+        all_failure_reasons.append(last_failure_reason)
         log_progress(run_dir, f"RUN {outer_run} initial FAIL (errors=0)")
 
     # -- REFINE / CORRECT / VERIFY / CLASSIFY loop --
@@ -467,6 +520,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
             candidate = call(
                 build_refinement_messages(problem, candidate, verification),
                 f"ITER {i+1} REFINE",
+                max_tokens=CORRECT_MAX_TOKENS,
+                thinking_budget=CORRECT_THINKING_BUDGET,
             )
             candidate_num += 1
             save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
@@ -491,6 +546,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 candidate = call(
                     build_correction_messages(problem, base, verification),
                     f"ITER {i+1} CORRECT",
+                    max_tokens=CORRECT_MAX_TOKENS,
+                    thinking_budget=CORRECT_THINKING_BUDGET,
                 )
                 candidate_num += 1
                 save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
@@ -539,6 +596,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
         else:
             consecutive_no += 1
             last_failure_reason = extract_failure_reason(verification)
+            all_failure_reasons.append(last_failure_reason)
             log_progress(
                 run_dir,
                 f"RUN {outer_run} ITER {i+1} FAIL "
@@ -579,7 +637,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 "accepted": False,
                 "status": "failed",
             })
-            return False, None, {"total_tokens": total_tokens, "failure_reason": last_failure_reason}
+            combined_reason = " | ".join(all_failure_reasons[-3:]) if all_failure_reasons else last_failure_reason
+            return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
 
     log_progress(
         run_dir, f"RUN {outer_run} EXHAUSTED: {MAX_ITERATIONS} iterations"
@@ -592,7 +651,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
         "accepted": False,
         "status": "exhausted",
     })
-    return False, None, {"total_tokens": total_tokens, "failure_reason": last_failure_reason}
+    combined_reason = " | ".join(all_failure_reasons[-3:]) if all_failure_reasons else last_failure_reason
+    return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
 
 
 # -- Main --
@@ -711,6 +771,17 @@ def main():
             time.sleep(backoff)
             # Retry the same outer run instead of advancing
             continue
+        except _WallClockTimeout as exc:
+            # Gap 6: Wall-clock timeout propagated from chat_completion (not retried).
+            # Treat as a failed run — the pivot mechanism will try a fresh approach.
+            log_progress(args.run_dir, f"RUN {outer_run} WALL_CLOCK_TIMEOUT: {exc}")
+            last_failure_reason = f"Wall-clock timeout — previous attempt took too long (possible server stall or oversized response)"
+            save_state(args.run_dir, {
+                "outer_run": outer_run,
+                "status": "wall_clock_timeout",
+                "error": str(exc),
+            })
+            continue
         except Exception as exc:
             log_progress(args.run_dir, f"RUN {outer_run} ERROR: {exc}")
             traceback.print_exc()
@@ -769,3 +840,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

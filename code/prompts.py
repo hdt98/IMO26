@@ -9,6 +9,7 @@ step1_prompt = """
 ### Core Instructions ###
 
 *   **Rigor is Paramount:** Your primary goal is to produce a complete and rigorously justified solution. Every step in your solution must be logically sound and clearly explained. A correct final answer derived from flawed or incomplete reasoning is considered a failure.
+*   **Prove Every Step:** Never dismiss a key step as "standard," "well-known," or "by a standard argument." Every claim that is essential to the proof must be explicitly justified. If you cite a known result, state it precisely and either prove it or reduce it to a proven lemma. An unjustified "standard result" is treated as a gap.
 *   **Honesty About Completeness:** If you cannot find a complete solution, you must **not** guess or create a solution that appears correct but contains hidden flaws or justification gaps. Instead, you should present only significant partial results that you can rigorously prove. A partial result is considered significant if it represents a substantial advancement toward a full solution. Examples include:
     *   Proving a key lemma.
     *   Fully resolving one or more cases within a logically sound case-based proof.
@@ -47,7 +48,9 @@ You have an opportunity to improve your solution. Please review your solution ca
 """
 
 correction_prompt = """
-Below is the bug report. If you agree with certain item in it, can you improve your solution so that it is complete and rigorous? Note that the evaluator who generates the bug report can misunderstand your solution and thus make mistakes. If you do not agree with certain item in the bug report, please add some detailed explanations to avoid such misunderstanding. Your new solution should strictly follow the instructions in the system prompt.
+Below is the full verification report (including both the summary and the detailed step-by-step verification log). Focus on fixing the most critical error first. Make targeted fixes to the specific errors identified in the bug report — do not rewrite the entire solution. Preserve the parts of your solution that the verifier confirmed as correct. If you disagree with a finding in the bug report, explain why with precise mathematical reasoning. Your new solution should strictly follow the instructions in the system prompt.
+
+(Presentation limit: keep your complete final response under 2500 words. This is a presentation limit only, not a mathematical constraint or hint.)
 """
 
 verification_system_prompt = """
@@ -111,5 +114,8 @@ Your task is to act as an IMO grader. Now, generate the **summary** and the **st
 classifier_prompt = 'Response in "yes", "improve", or "no". Is the following verification saying the solution is correct ("yes"), has only minor justification gaps that do not invalidate the conclusion ("improve"), or has a critical error or major justification gap that invalidates the solution ("no")?'
 
 refinement_prompt = """
-Below is the verification report. The solution is fundamentally correct but has minor justification gaps. Please close these gaps while keeping the same approach and structure. Do not change the main argument or introduce new techniques. Your refined solution should strictly follow the instructions in the system prompt.
+Below is the full verification report (including both the summary and the detailed step-by-step verification log). The solution is fundamentally correct but has minor justification gaps. Please close these gaps while keeping the same approach and structure. Do not change the main argument or introduce new techniques. Make targeted fixes only. Your refined solution should strictly follow the instructions in the system prompt.
+
+(Presentation limit: keep your complete final response under 2500 words. This is a presentation limit only, not a mathematical constraint or hint.)
 """
+

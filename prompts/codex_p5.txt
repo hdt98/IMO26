@@ -41,7 +41,7 @@ happened mathematically and what the next step is trying to fix. Keep the
 summary concise but substantive (3-5 sentences).
 
 The orchestrator has built-in protections that work without agent
-intervention: a wall-clock timeout (signal.alarm, 5400s per API call) that
+intervention: a wall-clock timeout (threading.Timer, 5400s per API call) that
 prevents hung processes, infrastructure error detection with exponential
 backoff (waits instead of burning through runs when endpoint is down), a
 lock file that prevents duplicate runs for the same problem, a three-tier

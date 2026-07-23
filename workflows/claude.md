@@ -27,7 +27,7 @@ Direct IP endpoint:
 Never print or persist the token in source files.
 
 The orchestrator already encodes max_tokens=256000 with thinking_budget=200000,
-a 5400-second HTTP timeout, a 5400-second wall-clock timeout (signal.alarm),
+a 5400-second HTTP timeout, a 5400-second wall-clock timeout (threading.Timer),
 and no more than three transport retries. These values are proven from
 the P3 run: the solver used 124650 reasoning tokens out of the 200000 budget
 and completed normally with finish_reason=stop.
@@ -124,10 +124,10 @@ happened in memory and will be reflected in the next state.json save.
 The orchestrator has built-in protections that work without agent
 intervention:
 
-1. Wall-clock timeout: signal.alarm fires after 5400 seconds (90 minutes)
+1. Wall-clock timeout: threading.Timer fires after 5400 seconds (90 minutes)
    per API call, regardless of server keepalive. If the server sends
    partial data that prevents the HTTP read timeout from firing, the
-   alarm still triggers, causing a retry. No external watchdog needed.
+   timer still triggers, aborting the call without retry. The failed run is then treated as a regular failure, triggering the pivot mechanism if needed.
 
 2. Infrastructure error detection: connection errors (endpoint down,
    DNS failure) are detected separately from model errors. The
