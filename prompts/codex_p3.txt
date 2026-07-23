@@ -31,6 +31,15 @@ yield_time_ms=300000) to detect completion, and separate exec_command calls
 to check tail -5 progress.log and cat state.json. Poll no more than once
 every 5 minutes. Only report when an iteration completes or an error occurs.
 
+When an iteration completes (VERIFY or CLASSIFY), read the latest artifacts
+from the run_XX/ subdirectory in the run directory to report substantively:
+  - cat <run-dir>/run_XX/classify_YY.md — the classification verdict (yes/improve/no)
+  - head -30 <run-dir>/run_XX/verify_YY.md — key findings from the verification
+Summarize what the verifier found (critical errors, justification gaps) and
+what the classifier decided. Do not just report token counts — explain what
+happened mathematically and what the next step is trying to fix. Keep the
+summary concise but substantive (3-5 sentences).
+
 The orchestrator has built-in protections that work without agent
 intervention: a wall-clock timeout (signal.alarm, 5400s per API call) that
 prevents hung processes, infrastructure error detection with exponential
