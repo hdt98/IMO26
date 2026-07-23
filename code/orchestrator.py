@@ -174,6 +174,7 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None):
         "max_tokens": MAX_TOKENS,
         "thinking": {"type": "enabled", "budget_tokens": THINKING_BUDGET},
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     last_error = None
     for attempt in range(1, MAX_TRANSPORT_RETRIES + 1):
