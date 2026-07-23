@@ -29,6 +29,11 @@ thinking_budget=200000, HTTP_TIMEOUT=5400, MAX_TRANSPORT_RETRIES=3,
 MAX_ERRORS=3 (consecutive failures before run restart), REQUIRED_PASSES=5,
 WALL_CLOCK_TIMEOUT=5400 (90 minutes per API call).
 
+The orchestrator uses streaming mode (stream=True) with SSE chunk parsing
+and stream_options={"include_usage": true} to capture token counts. Streaming
+keeps the connection alive during long generation (20-60 min per SOLVE call)
+and prevents the server from closing idle non-streaming connections.
+
 ## Launch (exec_command - no screen)
 
 Launch the orchestrator directly via exec_command. The process becomes a child
@@ -99,7 +104,7 @@ happened in memory and will be reflected in the next state.json save.
 
 ### Built-in protections
 
-The orchestrator has two built-in protections that work without agent
+The orchestrator has built-in protections that work without agent
 intervention:
 
 1. Wall-clock timeout: signal.alarm fires after 5400 seconds (90 minutes)
