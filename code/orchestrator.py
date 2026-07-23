@@ -54,7 +54,7 @@ REQUIRED_PASSES = 5
 MAX_OUTER_RUNS = 10
 MAX_TOKENS = 256_000
 THINKING_BUDGET = 200_000
-HTTP_TIMEOUT = 3600
+HTTP_TIMEOUT = 5400
 MAX_TRANSPORT_RETRIES = 3
 
 # Wall-clock timeout per API call. Python requests timeout is a read
@@ -62,7 +62,7 @@ MAX_TRANSPORT_RETRIES = 3
 # keepalive or partial data resets the read timer indefinitely, causing
 # processes to hang at 0% CPU forever (observed on P2 SOLVE). The
 # signal.alarm fires regardless of what the server sends.
-# Set to 3600 (same as HTTP_TIMEOUT) so legitimate long-running calls
+# Set to 5400 (same as HTTP_TIMEOUT) so legitimate long-running calls
 # are unaffected - only truly stuck processes are caught.
 WALL_CLOCK_TIMEOUT = 5400  # max wall-clock per API call (90 min)
 
