@@ -471,6 +471,31 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
         else:
             log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: code execution failed (rc={rc}), stderr={stderr[:200]}")
             return None
+    except _WallClockTimeout:
+        # Gap O: Wall-clock timeout on EMPIRICAL_PROBE — retry with halved budget
+        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: wall-clock timeout, retry with halved budget")
+        retry_messages = list(messages) + [
+            {"role": "user", "content": "Your previous attempt timed out. Generate much shorter code — use the simplest possible approach, under 50 lines, no comments."}
+        ]
+        try:
+            content, usage, finish = chat_completion(
+                api_url, api_key, model, retry_messages,
+                log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
+                max_tokens=VALIDATION_MAX_TOKENS // 2,
+                thinking_budget=VALIDATION_THINKING_BUDGET,
+            )
+            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry {usage.get('total_tokens', 0)} tokens finish={finish}")
+            stdout, stderr, rc = execute_python_code(content)
+            if rc == 0 and stdout.strip():
+                result = stdout.strip()
+                log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: success after timeout retry, {len(result)} chars output")
+                return result
+            else:
+                log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry code execution failed (rc={rc}), stderr={stderr[:200]}")
+                return None
+        except Exception as e:
+            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry error: {e}")
+            return None
     except Exception as e:
         log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: error: {e}")
         return None
