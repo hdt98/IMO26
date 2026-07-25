@@ -51,6 +51,15 @@ correction_prompt = """
 Below is the full verification report (including both the summary and the detailed step-by-step verification log). Focus on fixing the most critical error first. Make targeted fixes to the specific errors identified in the bug report — do not rewrite the entire solution. Preserve the parts of your solution that the verifier confirmed as correct. If you disagree with a finding in the bug report, explain why with precise mathematical reasoning. Your new solution should strictly follow the instructions in the system prompt.
 
 (Presentation limit: keep your complete final response under 2500 words. This is a presentation limit only, not a mathematical constraint or hint.)
+
+### Self-Verification Requirement ###
+
+Before finalizing your corrected solution, you MUST verify that your fix actually resolves the flagged issue. Specifically:
+- If the fix involves an algebraic identity, state the explicit computation that verifies it (not just "by expansion")
+- If the fix involves a strategy, verify it against small cases
+- If you cannot verify the fix, state this honestly rather than asserting it works
+
+A correction that introduces a new unverified claim is worse than the original gap.
 """
 
 verification_system_prompt = """
@@ -119,3 +128,50 @@ Below is the full verification report (including both the summary and the detail
 (Presentation limit: keep your complete final response under 2500 words. This is a presentation limit only, not a mathematical constraint or hint.)
 """
 
+
+
+empirical_probe_prompt = """
+Write a self-contained Python script that computes the answer to the following problem for the smallest meaningful cases (e.g., n=1, 2, 3, 4). The script should:
+- Be completely self-contained (only use sympy and the standard library)
+- Print each case with its answer in a clear format like "n=1: result"
+- Use brute-force or exhaustive search where feasible
+- NOT attempt to solve the problem in general
+- If the problem involves a game, enumerate all possible moves for small n
+- If the problem involves a sequence, compute the first several terms
+- Keep the code under 150 lines — no comments, no docstrings, no unnecessary helper functions
+- Use the most compact brute-force approach possible; avoid over-engineering
+- Prefer one-liners, comprehensions, and inline logic over multi-function architectures
+
+Output only the Python code, no explanations or markdown fences.
+"""
+
+cas_verify_prompt = """
+Below is a mathematical solution. Extract every algebraic identity, polynomial divisibility claim, or similar verifiable assertion. For each, write SymPy verification code. The script should:
+- Import sympy and define all relevant symbolic variables
+- For each identity: compute both sides, simplify, and check equality
+- For polynomial divisibility: compute remainder and check if zero
+- Print "PASS: <brief description>" or "FAIL: <brief description>" for each
+
+If there are no algebraic identities to verify, print "NO_ALGEBRAIC_CLAIMS".
+
+Output only the Python code, no explanations or markdown fences.
+
+### Solution ###
+"""
+
+cas_compute_prompt = """
+Below is a mathematical solution with a verification report identifying a justification gap. The gap involves an algebraic identity or computation that the solution admits it cannot complete.
+
+Your task: Write SymPy code that directly verifies the incomplete identity or computation.
+
+- Read the solution to identify the exact identity and any constraints (e.g., parallel conditions, angle relations)
+- Define all symbolic variables
+- Compute both sides of the identity (or the expression that should be zero)
+- Apply any constraints from the solution to eliminate variables
+- Simplify and check if the result is zero
+- Print "IDENTITY_CONFIRMED" if the identity holds, or "IDENTITY_DENIED: <reason>" if it does not
+
+Keep the code under 150 lines. Output only the Python code, no explanations or markdown fences.
+
+### Solution ###
+"""

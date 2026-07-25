@@ -25,6 +25,9 @@ import json
 import os
 import signal
 import sys
+import subprocess
+import re
+import tempfile
 import threading
 import time
 import traceback
@@ -38,6 +41,9 @@ from prompts import (
     step1_prompt,
     self_improvement_prompt,
     correction_prompt,
+    empirical_probe_prompt,
+    cas_verify_prompt,
+    cas_compute_prompt,
     verification_system_prompt,
     verification_reminder,
     classifier_prompt,
@@ -61,6 +67,10 @@ HTTP_TIMEOUT = 5400
 MAX_TRANSPORT_RETRIES = 3
 MAX_INFRA_RETRIES = 5  # consecutive infra errors before giving up
 INFRA_BACKOFF_BASE = 30  # seconds, doubled each consecutive infra error
+VALIDATION_TIMEOUT = 60  # seconds for executing empirical/CAS validation scripts
+VALIDATION_MAX_TOKENS = 65536  # token budget for validation code generation
+VALIDATION_THINKING_BUDGET = 4096  # thinking budget for validation code generation
+CAS_MAX_RETRIES = 1  # max CORRECT retry when CAS verification fails
 
 # Wall-clock timeout per API call. Uses threading.Timer (not signal.alarm)
 # because signal.alarm delivery is delayed by 500+ seconds on macOS when the
@@ -304,8 +314,12 @@ DNL = "\n\n"
 DIV = "\n" + "=" * 70 + "\n"
 
 
-def build_solver_messages(problem, outer_run=1, pivot_hint=None):
+def build_solver_messages(problem, outer_run=1, pivot_hint=None, empirical_results=None, failure_context=None):
     user = problem.strip() + PRESENTATION_LIMIT_NOTE
+    if empirical_results:
+        user += chr(10) + chr(10) + "### Computational Ground Truth ###" + chr(10) + chr(10) + empirical_results
+    if failure_context:
+        user += chr(10) + chr(10) + failure_context
     if outer_run > 1:
         hint = pivot_hint if pivot_hint else PIVOT_HINT
         user += chr(10) + chr(10) + hint
@@ -354,12 +368,14 @@ def build_classifier_messages(verification):
     return [{"role": "user", "content": user}]
 
 
-def build_correction_messages(problem, solution, verification):
+def build_correction_messages(problem, solution, verification, cas_feedback=None):
     # Gap 7: Send the ENTIRE verification (Summary + Detailed Log) to the
     # corrector, not just the Summary. The detailed log contains numerical
     # counterexamples and step-by-step reasoning that the corrector needs.
     bug_report = verification.strip()
     user2 = correction_prompt.strip() + DNL + DIV + "### Full Verification Report ###" + DNL + bug_report
+    if cas_feedback:
+        user2 += DNL + DIV + "### CAS Verification Failure ###" + DNL + "The following algebraic claims in your previous correction FAILED computational verification:" + DNL + DNL + cas_feedback + DNL + DNL + "You MUST fix these failures. Do not assert identities without verifying them computationally."
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": problem.strip()},
@@ -381,6 +397,258 @@ def build_refinement_messages(problem, solution, verification):
 
 
 # -- Solver loop --
+
+def execute_python_code(code, timeout=VALIDATION_TIMEOUT):
+    """Execute Python code in a subprocess. Returns (stdout, stderr, returncode)."""
+    # Strip markdown fences if present
+    lines = code.split(chr(10))
+    bt3 = chr(96) * 3
+    if lines and lines[0].startswith(bt3):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == bt3:
+        lines = lines[:-1]
+    code = chr(10).join(lines).strip()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+        f.write(code)
+        f.flush()
+        script_path = f.name
+    try:
+        result = subprocess.run(
+            ["python3", script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"Timeout after {timeout}s", -1
+    except Exception as e:
+        return "", str(e), -1
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+
+def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
+    """Core Fix A: Generate and execute a validation script that computes
+    small cases before SOLVE. Returns the computational results as a string,
+    or None if validation fails."""
+    log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: start")
+    messages = [
+        {"role": "system", "content": "You are a Python programmer. Write self-contained, executable Python code only."},
+        {"role": "user", "content": empirical_probe_prompt.strip() + DNL + DIV + "### Problem ###" + DNL + problem.strip()},
+    ]
+    try:
+        content, usage, finish = chat_completion(
+            api_url, api_key, model, messages,
+            log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
+            max_tokens=VALIDATION_MAX_TOKENS,
+            thinking_budget=VALIDATION_THINKING_BUDGET,
+        )
+        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {usage.get("total_tokens", 0)} tokens finish={finish}")
+        if finish == "length":
+            # Fix 1: Universal truncation retry with feedback + halved budget
+            probe_tokens = usage.get("total_tokens", 0)
+            truncation_feedback = f"Your previous attempt generated {probe_tokens} tokens and was truncated. Generate much shorter code — use the simplest possible approach, under 100 lines, no comments."
+            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: truncated, retry with feedback + halved budget")
+            retry_messages = list(messages) + [
+                {"role": "user", "content": truncation_feedback}
+            ]
+            content, usage, finish = chat_completion(
+                api_url, api_key, model, retry_messages,
+                log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
+                max_tokens=VALIDATION_MAX_TOKENS // 2,
+                thinking_budget=VALIDATION_THINKING_BUDGET,
+            )
+            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: retry {usage.get("total_tokens", 0)} tokens finish={finish}")
+        stdout, stderr, rc = execute_python_code(content)
+        if rc == 0 and stdout.strip():
+            result = stdout.strip()
+            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: success, {len(result)} chars output")
+            return result
+        else:
+            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: code execution failed (rc={rc}), stderr={stderr[:200]}")
+            return None
+    except Exception as e:
+        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: error: {e}")
+        return None
+
+
+def cas_verify_candidate(candidate, api_url, api_key, model, run_dir, outer_run, iteration):
+    """Core Fix D: Generate and execute SymPy verification code for algebraic
+    claims in the candidate. Returns (all_pass, details_string)."""
+    label = f"ITER {iteration}" if iteration else "initial"
+    log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: start")
+    detailed = extract_section(candidate, "Detailed Solution")
+    if not detailed:
+        detailed = candidate.strip()
+    messages = [
+        {"role": "system", "content": "You are a Python programmer specializing in SymPy. Write self-contained, executable Python code only."},
+        {"role": "user", "content": cas_verify_prompt.strip() + DNL + detailed},
+    ]
+    try:
+        content, usage, finish = chat_completion(
+            api_url, api_key, model, messages,
+            log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: {msg}"),
+            max_tokens=VALIDATION_MAX_TOKENS,
+            thinking_budget=VALIDATION_THINKING_BUDGET,
+        )
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: {usage.get("total_tokens", 0)} tokens finish={finish}")
+        stdout, stderr, rc = execute_python_code(content)
+        if rc == 0 and stdout.strip():
+            output = stdout.strip()
+            if "NO_ALGEBRAIC_CLAIMS" in output:
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: no algebraic claims found")
+                return True, ""
+            elif "FAIL:" in output:
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: FAIL detected")
+                return False, output
+            else:
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: all claims PASS")
+                return True, output
+        else:
+            if finish == "length":
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: code truncated (finish=length), treating as FAIL")
+                return False, "CAS verification code was truncated (finish=length). Please generate shorter, more compact SymPy code."
+            log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: code execution failed (rc={rc})")
+            return False, f"CAS verification code crashed on execution (rc={rc}). Error: {stderr[:500]}. Please generate correct, executable SymPy code."
+    except Exception as e:
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: error: {e}")
+        return False, f"CAS verification encountered an error: {e}. Please generate correct, executable SymPy code."
+
+
+def cas_compute_gap(candidate, verification, api_url, api_key, model, run_dir, outer_run, iteration):
+    """Fix 2: When VERIFY finds only Justification Gaps (no Critical Errors),
+    attempt to directly verify the incomplete identity using SymPy.
+    Returns augmented candidate if identity confirmed, None otherwise."""
+    label = f"ITER {iteration}" if iteration else "initial"
+
+    # Only attempt when verification has Justification Gap but no Critical Error
+    if "Critical Error" in verification or "Justification Gap" not in verification:
+        return None
+
+    log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: start")
+    detailed = extract_section(candidate, "Detailed Solution")
+    if not detailed:
+        detailed = candidate.strip()
+    messages = [
+        {"role": "system", "content": "You are a Python programmer specializing in SymPy. Write self-contained, executable Python code only."},
+        {"role": "user", "content": cas_compute_prompt.strip() + DNL + detailed + DNL + DIV + "### Verification Report ###" + DNL + verification.strip()},
+    ]
+    try:
+        content, usage, finish = chat_completion(
+            api_url, api_key, model, messages,
+            log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {msg}"),
+            max_tokens=VALIDATION_MAX_TOKENS,
+            thinking_budget=VALIDATION_THINKING_BUDGET,
+        )
+        probe_tokens = usage.get('total_tokens', 0)
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {probe_tokens} tokens finish={finish}")
+        if finish == "length":
+            # Fix 1: truncation retry with feedback + halved budget
+            truncation_feedback = f"Your previous attempt generated {probe_tokens} tokens and was truncated. Generate much shorter code."
+            log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: truncated, retry with halved budget")
+            retry_messages = list(messages) + [{"role": "user", "content": truncation_feedback}]
+            content, usage, finish = chat_completion(
+                api_url, api_key, model, retry_messages,
+                log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {msg}"),
+                max_tokens=VALIDATION_MAX_TOKENS // 2,
+                thinking_budget=VALIDATION_THINKING_BUDGET,
+            )
+            probe_tokens = usage.get('total_tokens', 0)
+            log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: retry {probe_tokens} tokens finish={finish}")
+        stdout, stderr, rc = execute_python_code(content)
+        if rc == 0 and stdout.strip():
+            output = stdout.strip()
+            if "IDENTITY_CONFIRMED" in output:
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: IDENTITY CONFIRMED")
+                augmented = candidate + chr(10) + chr(10) + "---" + chr(10)
+                augmented += "**CAS-Verified Identity:** The algebraic identity flagged as incomplete in the verification report has been computationally verified using SymPy. The expression simplifies to zero under the given constraints." + chr(10) + chr(10)
+                augmented += "SymPy verification output:" + chr(10) + "```" + chr(10) + output + chr(10) + "```"
+                return augmented
+            elif "IDENTITY_DENIED" in output:
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: IDENTITY DENIED")
+                return None
+            else:
+                log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: inconclusive output")
+                return None
+        else:
+            log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: code execution failed (rc={rc})")
+            return None
+    except Exception as e:
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: error: {e}")
+        return None
+
+
+def extract_error_locations(verification):
+    """Core Fix B: Extract (step_number, error_type) pairs from verification text."""
+    locations = []
+    for match in re.finditer(r"\*\*Step (\d+)[^*]*\*\*.*?\*\*(Critical Error|Justification Gap)\*\*", verification, re.DOTALL):
+        locations.append((int(match.group(1)), match.group(2)))
+    for match in re.finditer(r"\*\*Location:.*?Step (\d+).*?\*\*\s*\n\s*\*\*Issue:\*\*\s*(Critical Error|Justification Gap)", verification, re.DOTALL):
+        step = int(match.group(1))
+        etype = match.group(2)
+        if (step, etype) not in locations:
+            locations.append((step, etype))
+    return locations
+
+
+def detect_structural_error(current_locations, previous_locations_list):
+    """Core Fix B: Detect if error pattern suggests a structural issue.
+    Returns (is_structural, reason)."""
+    if not current_locations:
+        return False, ""
+    current_steps = {loc[0] for loc in current_locations}
+    current_criticals = {loc[0] for loc in current_locations if loc[1] == "Critical Error"}
+    if previous_locations_list:
+        prev_steps = {loc[0] for loc in previous_locations_list[-1]}
+        overlap = current_steps & prev_steps
+        if overlap:
+            return True, f"Same step(s) {overlap} failed in consecutive iterations"
+    if 1 in current_criticals:
+        return True, "Critical Error in Step 1 (foundational)"
+    if previous_locations_list:
+        prev_criticals = {loc[0] for loc in previous_locations_list[-1] if loc[1] == "Critical Error"}
+        new_criticals = current_criticals - prev_criticals
+        if new_criticals:
+            return True, f"Correction introduced new Critical Error(s) in step(s) {new_criticals}"
+    return False, ""
+
+
+def read_failure_ledger(run_dir):
+    """Core Fix C: Read the failure ledger from the run directory."""
+    ledger_path = run_dir / "failure_ledger.json"
+    if not ledger_path.exists():
+        return []
+    try:
+        return json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def write_failure_ledger(run_dir, entry):
+    """Core Fix C: Append an entry to the failure ledger."""
+    ledger_path = run_dir / "failure_ledger.json"
+    ledger = read_failure_ledger(run_dir)
+    ledger.append(entry)
+    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def build_failure_ledger_context(ledger):
+    """Core Fix C: Build a context string from the failure ledger for SOLVE prompt."""
+    if not ledger:
+        return ""
+    lines = ["### Prior Attempts (Cross-Run Knowledge) ###", ""]
+    for entry in ledger:
+        run = entry.get("run", "?")
+        reason = entry.get("failure_reason", entry.get("errors", "unknown"))
+        lines.append(f"Run {run}: {reason}")
+        if entry.get("empirical_results"):
+            lines.append(f"  Computational ground truth: {entry[chr(101)+chr(109)+chr(112)+chr(105)+chr(114)+chr(105)+chr(99)+chr(97)+chr(108)+chr(95)+chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(115)]}")
+        lines.append("")
+    return chr(10).join(lines)
 
 def extract_failure_reason(verification):
     """Extract a failure reason from the verification text.
@@ -413,7 +681,7 @@ def build_pivot_hint(failure_reason=None):
     return hint
 
 
-def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure_reason=None):
+def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure_reason=None, empirical_results=None, failure_context=None):
     """Run one outer attempt. Returns (accepted, candidate, summary)."""
     subdir = run_dir / f"run_{outer_run:02d}"
     subdir.mkdir(exist_ok=True)
@@ -427,17 +695,40 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
         nonlocal total_tokens
         def log_fn(msg):
             log_progress(run_dir, f"RUN {outer_run} {label}: {msg}")
-        content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget)
+        # Fix 4: Catch wall-clock timeout — treat as truncation, don't propagate to main
+        try:
+            content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget)
+        except _WallClockTimeout:
+            log_progress(run_dir, f"RUN {outer_run} {label}: wall-clock timeout, treating as truncation")
+            try:
+                retry_messages = list(messages) + [
+                    {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
+                ]
+                content2, usage2, finish2 = chat_completion(
+                    api_url, api_key, model, retry_messages, log_fn=log_fn
+                )
+                tokens2 = usage2.get("total_tokens", 0)
+                total_tokens += tokens2
+                log_progress(run_dir, f"RUN {outer_run} {label}: timeout retry {tokens2} tokens finish={finish2}")
+                if content2.strip():
+                    return content2
+            except _WallClockTimeout:
+                log_progress(run_dir, f"RUN {outer_run} {label}: timeout retry also timed out")
+            return ""  # Empty → will fail verification → error_count increments, no full pivot
         tokens = usage.get("total_tokens", 0)
         total_tokens += tokens
         log_progress(run_dir, f"RUN {outer_run} {label}: {tokens} tokens finish={finish}")
         if finish == "length":
-            log_progress(run_dir, f"RUN {outer_run} {label}: truncated, neutral retry")
+            # Fix 1: Universal truncation retry with feedback + halved budget
+            truncation_feedback = f"Your previous attempt generated {tokens} tokens and was truncated. Be more concise — focus on the essential content and omit unnecessary detail."
+            log_progress(run_dir, f"RUN {outer_run} {label}: truncated, retry with feedback + halved budget")
             retry_messages = list(messages) + [
-                {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
+                {"role": "user", "content": truncation_feedback + chr(10) + chr(10) + NEUTRAL_COMPLETE_REQUEST}
             ]
+            retry_max_tokens = max(8192, (max_tokens or MAX_TOKENS) // 2)
             content2, usage2, finish2 = chat_completion(
-                api_url, api_key, model, retry_messages, log_fn=log_fn
+                api_url, api_key, model, retry_messages, log_fn=log_fn,
+                max_tokens=retry_max_tokens,
             )
             tokens2 = usage2.get("total_tokens", 0)
             total_tokens += tokens2
@@ -452,7 +743,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     # -- SOLVE --
     log_progress(run_dir, f"RUN {outer_run} SOLVE: start")
     pivot_hint = build_pivot_hint(prev_failure_reason) if outer_run > 1 else None
-    solution = call(build_solver_messages(problem, outer_run, pivot_hint), "SOLVE")
+    solution = call(build_solver_messages(problem, outer_run, pivot_hint, empirical_results, failure_context), "SOLVE")
     save_text(subdir, "draft.md", solution)
 
     # -- SELF-IMPROVE --
@@ -480,6 +771,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     last_good_candidate = candidate if correct_count > 0 else None
     last_failure_reason = None
     all_failure_reasons = []  # Gap 2: accumulate all failure reasons
+    error_locations_history = []  # Core Fix B: track error locations across iterations
 
     if is_standalone_yes(good_verify):
         pass_artifacts.append({
@@ -552,6 +844,33 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 candidate_num += 1
                 save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
 
+                # Core Fix D: CAS self-verification after CORRECT
+                cas_pass, cas_details = cas_verify_candidate(
+                    candidate, api_url, api_key, model, run_dir, outer_run, i + 1
+                )
+                if not cas_pass and CAS_MAX_RETRIES > 0:
+                    log_progress(run_dir, f"RUN {outer_run} ITER {i+1} CAS_RETRY: retrying CORRECT with CAS feedback")
+                    candidate = call(
+                        build_correction_messages(problem, base, verification, cas_feedback=cas_details),
+                        f"ITER {i+1} CAS_RETRY",
+                        max_tokens=CORRECT_MAX_TOKENS,
+                        thinking_budget=CORRECT_THINKING_BUDGET,
+                    )
+                    candidate_num += 1
+                    save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
+
+                # Fix 2: CAS_COMPUTE — try to close computational identity gaps
+                # When previous verification had only Justification Gaps (no Critical Errors),
+                # attempt direct CAS verification of the incomplete identity
+                if "Justification Gap" in verification and "Critical Error" not in verification:
+                    augmented = cas_compute_gap(
+                        candidate, verification, api_url, api_key, model, run_dir, outer_run, i + 1
+                    )
+                    if augmented:
+                        candidate = augmented
+                        candidate_num += 1
+                        save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
+
         # VERIFY
         log_progress(run_dir, f"RUN {outer_run} ITER {i+1} VERIFY: start")
         verification = call(
@@ -559,6 +878,9 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
             f"ITER {i+1} VERIFY",
         )
         save_text(subdir, f"verify_{verify_num:02d}.md", verification)
+
+        # Core Fix B: Track error locations for structural error detection
+        current_error_locations = extract_error_locations(verification)
 
         # CLASSIFY
         log_progress(run_dir, f"RUN {outer_run} ITER {i+1} CLASSIFY: start")
@@ -602,6 +924,28 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 f"RUN {outer_run} ITER {i+1} FAIL "
                 f"(passes={correct_count} errors={error_count})",
             )
+
+            # Core Fix B: Structural error detection
+            is_structural, structural_reason = detect_structural_error(
+                current_error_locations, error_locations_history
+            )
+            error_locations_history.append(current_error_locations)
+            if is_structural:
+                log_progress(
+                    run_dir,
+                    f"RUN {outer_run} ITER {i+1} STRUCTURAL_ERROR: {structural_reason}",
+                )
+                combined_reason = " | ".join(all_failure_reasons[-3:]) if all_failure_reasons else last_failure_reason
+                combined_reason += f" | STRUCTURAL: {structural_reason}"
+                save_state(run_dir, {
+                    "outer_run": outer_run,
+                    "iteration": i + 1,
+                    "consecutive_passes": correct_count,
+                    "error_count": error_count,
+                    "accepted": False,
+                    "status": "structural_error",
+                })
+                return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
 
         # Check thresholds
         if correct_count >= REQUIRED_PASSES:
@@ -729,6 +1073,13 @@ def main():
         })
 
         try:
+            # Core Fix A: Pre-SOLVE empirical validation
+            empirical_results = pre_solve_validation(
+                problem, args.api_url, args.api_key, args.model, args.run_dir, outer_run
+            )
+            # Core Fix C: Read failure ledger for cross-run knowledge
+            failure_ledger = read_failure_ledger(args.run_dir)
+            failure_context = build_failure_ledger_context(failure_ledger)
             accepted, candidate, summary = run_outer(
                 outer_run,
                 problem,
@@ -737,6 +1088,8 @@ def main():
                 args.model,
                 args.run_dir,
                 prev_failure_reason=last_failure_reason,
+                empirical_results=empirical_results,
+                failure_context=failure_context,
             )
             consecutive_infra_errors = 0
         except InfrastructureError as exc:
@@ -794,6 +1147,12 @@ def main():
 
         if not accepted and summary and summary.get("failure_reason"):
             last_failure_reason = summary["failure_reason"]
+            # Core Fix C: Write to failure ledger for cross-run knowledge
+            write_failure_ledger(args.run_dir, {
+                "run": outer_run,
+                "failure_reason": summary["failure_reason"],
+                "empirical_results": locals().get("empirical_results"),
+            })
 
         if accepted:
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -840,4 +1199,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
