@@ -646,7 +646,7 @@ def build_failure_ledger_context(ledger):
         reason = entry.get("failure_reason", entry.get("errors", "unknown"))
         lines.append(f"Run {run}: {reason}")
         if entry.get("empirical_results"):
-            lines.append(f"  Computational ground truth: {entry[chr(101)+chr(109)+chr(112)+chr(105)+chr(114)+chr(105)+chr(99)+chr(97)+chr(108)+chr(95)+chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(115)]}")
+            lines.append(f"  Computational ground truth: {entry['empirical_results']}")
         lines.append("")
     return chr(10).join(lines)
 
@@ -726,9 +726,11 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 {"role": "user", "content": truncation_feedback + chr(10) + chr(10) + NEUTRAL_COMPLETE_REQUEST}
             ]
             retry_max_tokens = max(8192, (max_tokens or MAX_TOKENS) // 2)
+            retry_thinking = min(thinking_budget or THINKING_BUDGET, retry_max_tokens - 8192)
             content2, usage2, finish2 = chat_completion(
                 api_url, api_key, model, retry_messages, log_fn=log_fn,
                 max_tokens=retry_max_tokens,
+                thinking_budget=retry_thinking,
             )
             tokens2 = usage2.get("total_tokens", 0)
             total_tokens += tokens2
@@ -1123,17 +1125,6 @@ def main():
                 sys.exit(1)
             time.sleep(backoff)
             # Retry the same outer run instead of advancing
-            continue
-        except _WallClockTimeout as exc:
-            # Gap 6: Wall-clock timeout propagated from chat_completion (not retried).
-            # Treat as a failed run — the pivot mechanism will try a fresh approach.
-            log_progress(args.run_dir, f"RUN {outer_run} WALL_CLOCK_TIMEOUT: {exc}")
-            last_failure_reason = f"Wall-clock timeout — previous attempt took too long (possible server stall or oversized response)"
-            save_state(args.run_dir, {
-                "outer_run": outer_run,
-                "status": "wall_clock_timeout",
-                "error": str(exc),
-            })
             continue
         except Exception as exc:
             log_progress(args.run_dir, f"RUN {outer_run} ERROR: {exc}")
