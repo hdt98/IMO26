@@ -484,7 +484,7 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
         # Gap O + Gap P: Wall-clock timeout on EMPIRICAL_PROBE — retry with
         # partial content carried forward (if any) and halved budget.
         partial = wc_exc.partial_content
-        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: wall-clock timeout (partial: {len(partial)} chars), retry with halved budget")
+        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: wall-clock timeout (partial: {len(partial)} chars content, {len(wc_exc.partial_reasoning)} chars reasoning), retry with halved budget")
         if partial.strip():
             retry_messages = list(messages) + [
                 {"role": "assistant", "content": partial},
