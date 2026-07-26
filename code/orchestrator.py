@@ -82,6 +82,10 @@ WALL_CLOCK_TIMEOUT = 5400  # max wall-clock per API call (90 min)
 
 class _WallClockTimeout(Exception):
     """Raised when the wall-clock timer fires during an API call."""
+    def __init__(self, message, partial_content="", partial_reasoning=""):
+        super().__init__(message)
+        self.partial_content = partial_content
+        self.partial_reasoning = partial_reasoning
 
 
 class InfrastructureError(Exception):
@@ -228,13 +232,16 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
                 # alive, preventing the server from closing it before the
                 # full response is generated.
                 content_parts = []
+                reasoning_parts = []
                 usage = {}
                 finish = "unknown"
                 for line in resp.iter_lines(decode_unicode=True):
                     if wc_timer.fired:
                         raise _WallClockTimeout(
                             f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s "
-                            "(server may be sending keepalive without real data)"
+                            "(server may be sending keepalive without real data)",
+                            partial_content="".join(content_parts),
+                            partial_reasoning="".join(reasoning_parts),
                         )
                     if not line:
                         continue
@@ -256,6 +263,8 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
                     if not choices:
                         continue
                     delta = choices[0].get("delta", {}) or {}
+                    if delta.get("reasoning_content"):
+                        reasoning_parts.append(delta["reasoning_content"])
                     if delta.get("content"):
                         content_parts.append(delta["content"])
                     fr = choices[0].get("finish_reason")
@@ -471,12 +480,20 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
         else:
             log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: code execution failed (rc={rc}), stderr={stderr[:200]}")
             return None
-    except _WallClockTimeout:
-        # Gap O: Wall-clock timeout on EMPIRICAL_PROBE — retry with halved budget
-        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: wall-clock timeout, retry with halved budget")
-        retry_messages = list(messages) + [
-            {"role": "user", "content": "Your previous attempt timed out. Generate much shorter code — use the simplest possible approach, under 50 lines, no comments."}
-        ]
+    except _WallClockTimeout as wc_exc:
+        # Gap O + Gap P: Wall-clock timeout on EMPIRICAL_PROBE — retry with
+        # partial content carried forward (if any) and halved budget.
+        partial = wc_exc.partial_content
+        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: wall-clock timeout (partial: {len(partial)} chars), retry with halved budget")
+        if partial.strip():
+            retry_messages = list(messages) + [
+                {"role": "assistant", "content": partial},
+                {"role": "user", "content": "Continue and complete your code from where you left off. Do not repeat what you already wrote."}
+            ]
+        else:
+            retry_messages = list(messages) + [
+                {"role": "user", "content": "Your previous attempt timed out. Generate much shorter code — use the simplest possible approach, under 50 lines, no comments."}
+            ]
         try:
             content, usage, finish = chat_completion(
                 api_url, api_key, model, retry_messages,
@@ -485,6 +502,8 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
                 thinking_budget=VALIDATION_THINKING_BUDGET,
             )
             log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry {usage.get('total_tokens', 0)} tokens finish={finish}")
+            if partial.strip():
+                content = partial + content
             stdout, stderr, rc = execute_python_code(content)
             if rc == 0 and stdout.strip():
                 result = stdout.strip()
@@ -723,12 +742,23 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
         # Fix 4: Catch wall-clock timeout — treat as truncation, don't propagate to main
         try:
             content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget)
-        except _WallClockTimeout:
-            log_progress(run_dir, f"RUN {outer_run} {label}: wall-clock timeout, treating as truncation")
+        except _WallClockTimeout as wc_exc:
+            # Gap P: Use partial streaming content as context for retry instead of starting from zero
+            partial = wc_exc.partial_content
+            partial_reasoning = wc_exc.partial_reasoning
+            log_progress(run_dir, f"RUN {outer_run} {label}: wall-clock timeout, treating as truncation (partial: {len(partial)} chars content, {len(partial_reasoning)} chars reasoning)")
             try:
-                retry_messages = list(messages) + [
-                    {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
-                ]
+                if partial.strip():
+                    # Include partial content as assistant message, ask to continue
+                    retry_messages = list(messages) + [
+                        {"role": "assistant", "content": partial},
+                        {"role": "user", "content": "Continue and complete your response from where you left off. Do not repeat what you already wrote."}
+                    ]
+                else:
+                    # No partial content (likely still in reasoning phase) — start fresh
+                    retry_messages = list(messages) + [
+                        {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
+                    ]
                 content2, usage2, finish2 = chat_completion(
                     api_url, api_key, model, retry_messages, log_fn=log_fn
                 )
@@ -736,6 +766,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 total_tokens += tokens2
                 log_progress(run_dir, f"RUN {outer_run} {label}: timeout retry {tokens2} tokens finish={finish2}")
                 if content2.strip():
+                    if partial.strip():
+                        return partial + content2
                     return content2
             except _WallClockTimeout:
                 log_progress(run_dir, f"RUN {outer_run} {label}: timeout retry also timed out")
