@@ -193,7 +193,7 @@ def is_standalone_improve(text):
 
 # -- API --
 
-def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=None, thinking_budget=None):
+def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=None, thinking_budget=None, reasoning_path=None):
     """Return (content, usage, finish_reason) from an OpenAI-compatible call.
 
     The GLM-5.2-FP8 endpoint supports Anthropic-style thinking via the
@@ -237,6 +237,8 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
                 finish = "unknown"
                 for line in resp.iter_lines(decode_unicode=True):
                     if wc_timer.fired:
+                        if reasoning_path is not None and reasoning_parts:
+                            reasoning_path.write_text("".join(reasoning_parts))
                         raise _WallClockTimeout(
                             f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s "
                             "(server may be sending keepalive without real data)",
@@ -273,6 +275,8 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
                 content = "".join(content_parts)
             finally:
                 wc_timer.cancel()
+            if reasoning_path is not None and reasoning_parts:
+                reasoning_path.write_text("".join(reasoning_parts))
             return content, usage, finish
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_error = exc
@@ -450,11 +454,13 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
         {"role": "user", "content": empirical_probe_prompt.strip() + DNL + DIV + "### Problem ###" + DNL + problem.strip()},
     ]
     try:
+        probe_rpath = run_dir / f"reasoning_PROBE_run{outer_run:02d}.txt"
         content, usage, finish = chat_completion(
             api_url, api_key, model, messages,
             log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
             max_tokens=VALIDATION_MAX_TOKENS,
             thinking_budget=VALIDATION_THINKING_BUDGET,
+            reasoning_path=probe_rpath,
         )
         log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {usage.get("total_tokens", 0)} tokens finish={finish}")
         if finish == "length":
@@ -470,6 +476,7 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
                 log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
                 max_tokens=VALIDATION_MAX_TOKENS // 2,
                 thinking_budget=VALIDATION_THINKING_BUDGET,
+                reasoning_path=run_dir / f"reasoning_PROBE_run{outer_run:02d}_trunc_retry.txt",
             )
             log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: retry {usage.get("total_tokens", 0)} tokens finish={finish}")
         stdout, stderr, rc = execute_python_code(content)
@@ -506,6 +513,7 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
                 log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
                 max_tokens=VALIDATION_MAX_TOKENS // 2,
                 thinking_budget=VALIDATION_THINKING_BUDGET,
+                reasoning_path=run_dir / f"reasoning_PROBE_run{outer_run:02d}_wc_retry.txt",
             )
             log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry {usage.get('total_tokens', 0)} tokens finish={finish}")
             if partial.strip():
@@ -544,6 +552,7 @@ def cas_verify_candidate(candidate, api_url, api_key, model, run_dir, outer_run,
             log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: {msg}"),
             max_tokens=VALIDATION_MAX_TOKENS,
             thinking_budget=VALIDATION_THINKING_BUDGET,
+            reasoning_path=run_dir / f"run_{outer_run:02d}" / f"reasoning_CAS_VERIFY_{label.replace(' ', '_')}.txt",
         )
         log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: {usage.get("total_tokens", 0)} tokens finish={finish}")
         stdout, stderr, rc = execute_python_code(content)
@@ -593,6 +602,7 @@ def cas_compute_gap(candidate, verification, api_url, api_key, model, run_dir, o
             log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {msg}"),
             max_tokens=VALIDATION_MAX_TOKENS,
             thinking_budget=VALIDATION_THINKING_BUDGET,
+            reasoning_path=run_dir / f"run_{outer_run:02d}" / f"reasoning_CAS_COMPUTE_{label.replace(' ', '_')}.txt",
         )
         probe_tokens = usage.get('total_tokens', 0)
         log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {probe_tokens} tokens finish={finish}")
@@ -606,6 +616,7 @@ def cas_compute_gap(candidate, verification, api_url, api_key, model, run_dir, o
                 log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {msg}"),
                 max_tokens=VALIDATION_MAX_TOKENS // 2,
                 thinking_budget=VALIDATION_THINKING_BUDGET,
+                reasoning_path=run_dir / f"run_{outer_run:02d}" / f"reasoning_CAS_COMPUTE_{label.replace(' ', '_')}_retry.txt",
             )
             probe_tokens = usage.get('total_tokens', 0)
             log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: retry {probe_tokens} tokens finish={finish}")
@@ -741,13 +752,17 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     verify_num = 0
     pass_artifacts = []
 
+    _reasoning_seq = [0]
     def call(messages, label, max_tokens=None, thinking_budget=None):
         nonlocal total_tokens
         def log_fn(msg):
             log_progress(run_dir, f"RUN {outer_run} {label}: {msg}")
         # Fix 4: Catch wall-clock timeout — treat as truncation, don't propagate to main
         try:
-            content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget)
+            _reasoning_seq[0] += 1
+            safe_label = label.replace(" ", "_")
+            rpath = subdir / f"reasoning_{_reasoning_seq[0]:02d}_{safe_label}.txt"
+            content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget, reasoning_path=rpath)
         except _WallClockTimeout as wc_exc:
             # Gap P: Use partial streaming content as context for retry instead of starting from zero
             partial = wc_exc.partial_content
@@ -772,8 +787,10 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                     retry_messages = list(messages) + [
                         {"role": "user", "content": NEUTRAL_COMPLETE_REQUEST}
                     ]
+                _reasoning_seq[0] += 1
+                rpath_wc = subdir / f"reasoning_{_reasoning_seq[0]:02d}_{safe_label}_wc_retry.txt"
                 content2, usage2, finish2 = chat_completion(
-                    api_url, api_key, model, retry_messages, log_fn=log_fn
+                    api_url, api_key, model, retry_messages, log_fn=log_fn, reasoning_path=rpath_wc
                 )
                 tokens2 = usage2.get("total_tokens", 0)
                 total_tokens += tokens2
@@ -797,10 +814,13 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
             ]
             retry_max_tokens = max(8192, (max_tokens or MAX_TOKENS) // 2)
             retry_thinking = min(thinking_budget or THINKING_BUDGET, retry_max_tokens - 8192)
+            _reasoning_seq[0] += 1
+            rpath_tr = subdir / f"reasoning_{_reasoning_seq[0]:02d}_{safe_label}_trunc_retry.txt"
             content2, usage2, finish2 = chat_completion(
                 api_url, api_key, model, retry_messages, log_fn=log_fn,
                 max_tokens=retry_max_tokens,
                 thinking_budget=retry_thinking,
+                reasoning_path=rpath_tr,
             )
             tokens2 = usage2.get("total_tokens", 0)
             total_tokens += tokens2
