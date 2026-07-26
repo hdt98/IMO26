@@ -490,6 +490,12 @@ def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
                 {"role": "assistant", "content": partial},
                 {"role": "user", "content": "Continue and complete your code from where you left off. Do not repeat what you already wrote."}
             ]
+        elif wc_exc.partial_reasoning.strip():
+            # Gap Q: Model produced reasoning but no visible code. Inject reasoning tail.
+            reasoning_tail = wc_exc.partial_reasoning[-10000:]
+            retry_messages = list(messages) + [
+                {"role": "user", "content": "Your previous attempt spent a long time reasoning but produced no code. Here is the tail of your reasoning:" + chr(10) + chr(10) + reasoning_tail + chr(10) + chr(10) + "Based on this reasoning, write the complete Python script now. Output only the code."}
+            ]
         else:
             retry_messages = list(messages) + [
                 {"role": "user", "content": "Your previous attempt timed out. Generate much shorter code — use the simplest possible approach, under 50 lines, no comments."}
@@ -753,6 +759,13 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                     retry_messages = list(messages) + [
                         {"role": "assistant", "content": partial},
                         {"role": "user", "content": "Continue and complete your response from where you left off. Do not repeat what you already wrote."}
+                    ]
+                elif partial_reasoning.strip():
+                    # Gap Q: Model produced reasoning but no visible content. Inject the tail
+                    # of the reasoning as context so the model doesn't start from zero.
+                    reasoning_tail = partial_reasoning[-10000:]
+                    retry_messages = list(messages) + [
+                        {"role": "user", "content": "Your previous attempt spent a long time reasoning but produced no final output. Here is the tail of your reasoning:" + chr(10) + chr(10) + reasoning_tail + chr(10) + chr(10) + "Based on this reasoning, write the complete solution now. Do not repeat the reasoning — output only the final solution."}
                     ]
                 else:
                     # No partial content (likely still in reasoning phase) — start fresh
