@@ -379,9 +379,9 @@ def build_verifier_messages(problem, solution, formal_report=None):
     )
     if formal_report:
         user += (
-            DIV + "### Local Lean Formalization Report ###" + DNL
+            DIV + "### Formal Verification Report ###" + DNL
             + formal_report.strip() + DNL
-            + "A Lean compiler pass proves only the encoded theorem. Check that "
+            + "A formal backend pass proves only the encoded theorem. Check that "
             + "`imo_problem` faithfully states the entire natural-language problem; "
             + "flag any weakened, altered, or incomplete formalization as a Critical Error."
             + DNL
@@ -454,7 +454,7 @@ def build_lean_repair_messages(problem, solution, lean_source, report):
                 lean_repair_prompt.strip() + DNL + problem.strip() + DNL
                 + DIV + "### Informal Solution ###" + DNL + solution.strip() + DNL
                 + DIV + "### Broken Lean Source ###" + DNL + lean_source.strip() + DNL
-                + DIV + "### Local Lean Report ###" + DNL + report.strip()
+                + DIV + "### Formal Verification Report ###" + DNL + report.strip()
             ),
         },
     ]
@@ -1430,7 +1430,7 @@ def main():
         "--lean-mode",
         choices=("required", "best-effort", "off"),
         default=os.getenv("IMO_LEAN_MODE", "required"),
-        help="Local Lean policy. Default: required.",
+        help="Local-first formal verification policy. Default: required.",
     )
     parser.add_argument(
         "--lean-project",

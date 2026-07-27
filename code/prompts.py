@@ -193,8 +193,8 @@ Requirements:
 """
 
 lean_repair_prompt = """
-Repair the supplied Lean 4 formalization so that it compiles locally with Mathlib and remains
-a faithful formalization of the entire problem.
+Repair the supplied Lean 4 formalization so that it passes the configured formal
+verification checks and remains a faithful formalization of the entire problem.
 
 Requirements:
 - Output only the complete repaired Lean source file, without markdown fences

@@ -11,6 +11,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "code"))
 
 from orchestrator import (
+    build_lean_repair_messages,
+    build_verifier_messages,
     execute_axle_check,
     execute_lean_code,
     formal_backends_pass,
@@ -51,6 +53,25 @@ class LeanVerifierTests(unittest.TestCase):
         self.assertTrue(formal_backends_pass(True, True, "required"))
         self.assertFalse(formal_backends_pass(True, False, "required"))
         self.assertFalse(formal_backends_pass(False, True, "required"))
+
+    def test_formal_reports_use_backend_neutral_prompt_labels(self):
+        report = "Local Lean: FAIL\nAXLE (fallback): PASS"
+        verifier_prompt = build_verifier_messages(
+            "Prove the problem.",
+            "Detailed Solution\nA proof.",
+            report,
+        )[1]["content"]
+        repair_prompt = build_lean_repair_messages(
+            "Prove the problem.",
+            "A proof.",
+            "theorem imo_problem : True := by trivial",
+            report,
+        )[1]["content"]
+
+        self.assertIn("### Formal Verification Report ###", verifier_prompt)
+        self.assertIn("### Formal Verification Report ###", repair_prompt)
+        self.assertIn("passes the configured formal", repair_prompt)
+        self.assertNotIn("### Local Lean Report ###", repair_prompt)
 
     def test_axle_rejects_failed_declarations_even_when_code_compiles(self):
         class FakeAxleClient:

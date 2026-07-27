@@ -10,6 +10,82 @@ the mathematics itself.
 2. Read code/prompts.py and code/orchestrator.py to understand the algorithm.
 3. Create a fresh run directory: /tmp/imo26-<problem-id>-<UTC-timestamp>.
 
+## End-to-end flow
+
+The goal prompt starts Codex, but Codex does not solve the problem itself. It
+reads this workflow, launches `code/orchestrator.py`, and monitors the artifacts
+that the background process produces.
+
+```mermaid
+flowchart TD
+    A["Codex goal prompt"] --> B["Read workflow and problem"]
+    B --> C["Launch background orchestrator"]
+    C --> D["EMPIRICAL_PROBE<br/>compute small cases"]
+    D --> E["SOLVE<br/>empirical results are included"]
+    E --> F["SELF_IMPROVE"]
+    F --> G["New informal candidate"]
+    G --> H["LEAN_FORMALIZE<br/>generate imo_problem"]
+    H --> I{"Local Lean"}
+    I -->|"PASS"| K["Combined formal report<br/>AXLE = SKIP in fallback mode"]
+    I -->|"FAIL"| J{"AXLE fallback"}
+    J -->|"PASS"| K
+    J -->|"FAIL"| L["LEAN_REPAIR once"]
+    L --> M["Recheck local Lean<br/>then AXLE if local still fails"]
+    M --> K
+    K --> N["VERIFY<br/>proof audit + formal-statement fidelity"]
+    N --> O{"CLASSIFY"}
+    O -->|"yes, fewer than 5"| P["Reverify unchanged candidate<br/>reuse cached formal result"]
+    P --> N
+    O -->|"improve"| Q["REFINE<br/>new candidate"]
+    O -->|"no"| R["CORRECT + CAS checks<br/>new candidate"]
+    Q --> H
+    R --> H
+    O -->|"5 yes + formal gate"| S["ACCEPT"]
+```
+
+Stage boundaries:
+
+1. `EMPIRICAL_PROBE` generates and executes a small-case Python program. Its
+   printed results are included in the `SOLVE` request.
+2. `SOLVE` and `SELF_IMPROVE` produce the informal olympiad solution. Lean and
+   AXLE are not used in these stages.
+3. `LEAN_FORMALIZE` asks the model to translate each new informal candidate
+   into a theorem named `imo_problem`. This translation is model-generated;
+   neither Lean nor AXLE determines whether it faithfully represents the
+   original problem.
+4. Local Lean checks the generated source first. Under the prompt-selected
+   `--axle-mode fallback`, AXLE is attempted only if local Lean fails. The
+   shared policy check can reject a missing `imo_problem`, proof hole, or
+   disallowed declaration before any upload. If both backends fail,
+   `LEAN_REPAIR` gets the combined report and makes one repair attempt.
+5. `VERIFY` receives the problem, informal candidate, Lean source, and combined
+   formal report. It must separately audit whether `imo_problem` is a faithful
+   encoding; a compiled proof of a weakened theorem is still a Critical Error.
+6. `CLASSIFY` returns `yes`, `improve`, or `no`. A required formal-gate failure
+   cannot be classified as `yes`. Refinement or correction creates a new
+   candidate and therefore triggers a new formalization and formal check.
+7. Re-verifying an unchanged candidate reuses its cached Lean/AXLE result. It
+   does not repeatedly submit identical source to AXLE while accumulating the
+   five required verifier passes.
+
+AXLE never performs `EMPIRICAL_PROBE`, `SOLVE`, `SELF_IMPROVE`, `VERIFY`,
+`CLASSIFY`, CAS checks, or the informal correction itself. It is only a hosted
+Lean checker for the generated source.
+
+Formal-stage artifacts in `run_XX/`:
+
+| Artifact | Meaning |
+| --- | --- |
+| `candidate_NN.md` | Informal solution candidate |
+| `candidate_NN.lean` | First Lean formalization of that candidate |
+| `candidate_NN_lean_retry.lean` | One repaired formalization, when needed |
+| `lean_verify_NN.txt` | Combined local Lean and AXLE result plus final Lean source |
+| `verify_YY.md` | Mathematical proof audit and formal-statement fidelity audit |
+| `classify_YY.md` | `yes`, `improve`, or `no` verdict |
+
+AXLE does not write a separate report file. Its PASS, FAIL, or SKIP result is
+embedded in `lean_verify_NN.txt`.
+
 ## Transport
 
 The orchestrator makes OpenAI-compatible chat completion calls directly to the
@@ -48,6 +124,9 @@ Run this command via exec_command (yield_time_ms=3000):
       --api-url <endpoint> \
       --api-key <token> \
       --model <model> \
+      --lean-mode required \
+      --axle-mode fallback \
+      --axle-environment lean-4.28.0 \
       --run-dir <run-dir> \
       --output solutions/<problem-id>.md \
       > <run-dir>/stdout.log 2> <run-dir>/stderr.log
@@ -60,16 +139,24 @@ running). Save this session_id for monitoring with write_stdin.
 Local Lean is the default and AXLE is disabled unless a mode is explicitly
 selected. Install the optional client from `requirements-axle.txt`, inject
 `AXLE_API_KEY` into the orchestrator process environment without printing or
-persisting it, and add one of:
+persisting it, and select one of:
 
+    --axle-mode off
     --axle-mode fallback
     --axle-mode required
 
-`fallback` calls AXLE only after local Lean fails, and either backend may
-satisfy the formal gate. `required` calls AXLE for every formalization and
-requires both backends to pass. Use `--axle-environment <name>` to override the
-default hosted environment (`lean-4.28.0`). Never put the AXLE key in a command
-line or run artifact.
+`off` never contacts AXLE. `fallback` calls AXLE only after local Lean fails,
+and either backend may satisfy the formal gate. `required` calls AXLE for every
+formalization and requires both backends to pass. Use
+`--axle-environment <name>` to override the default hosted environment
+(`lean-4.28.0`). Never put the AXLE key in a command line or run artifact.
+
+The supplied `prompts/codex_p*.txt` files select `fallback`. Before starting
+Codex, make `AXLE_API_KEY` available to the environment inherited by the Codex
+app-server, or use an equivalent secure environment-injection mechanism. The
+orchestrator fails preflight before starting the run if fallback is selected
+but the key or AXLE client is unavailable; it does not silently downgrade to
+`off`.
 
 ## First check after launch
 
@@ -107,7 +194,13 @@ Repeat this cycle until the orchestrator completes:
        tail -5 <run-dir>/progress.log
        cat <run-dir>/state.json
 
-3. Report significant events only (passes, errors, acceptance, failure).
+3. When a formal or verification stage completes, inspect:
+       cat <run-dir>/run_XX/lean_verify_NN.txt
+       head -30 <run-dir>/run_XX/verify_YY.md
+       cat <run-dir>/run_XX/classify_YY.md
+   The formal report records local Lean and AXLE as PASS, FAIL, or SKIP.
+
+4. Report significant events only (passes, errors, acceptance, failure).
    Do NOT report every polling cycle.
 
 ### State.json lag warning

@@ -49,6 +49,9 @@ desired for long-running orchestrator runs that may take 30+ minutes.
         --api-url "$API_URL" \
         --api-key "$API_KEY" \
         --model "$MODEL_NAME" \
+        --lean-mode required \
+        --axle-mode fallback \
+        --axle-environment lean-4.28.0 \
         --run-dir /tmp/imo26-imo2026_p1-TIMESTAMP \
         --output solutions/imo2026_p1.md
 
@@ -61,16 +64,23 @@ management. Save the backgroundTaskId, the PID, and the run directory path.
 Local Lean is the default and AXLE is disabled unless a mode is explicitly
 selected. Install the optional client from `requirements-axle.txt`, inject
 `AXLE_API_KEY` into the orchestrator process environment without printing or
-persisting it, and add one of:
+persisting it, and select one of:
 
+    --axle-mode off
     --axle-mode fallback
     --axle-mode required
 
-`fallback` calls AXLE only after local Lean fails, and either backend may
-satisfy the formal gate. `required` calls AXLE for every formalization and
-requires both backends to pass. Use `--axle-environment <name>` to override the
-default hosted environment (`lean-4.28.0`). Never put the AXLE key in a command
-line or run artifact.
+`off` never contacts AXLE. `fallback` calls AXLE only after local Lean fails,
+and either backend may satisfy the formal gate. `required` calls AXLE for every
+formalization and requires both backends to pass. Use
+`--axle-environment <name>` to override the default hosted environment
+(`lean-4.28.0`). Never put the AXLE key in a command line or run artifact.
+
+The supplied `prompts/claude_p*.txt` files select `fallback`. Make
+`AXLE_API_KEY` available to the background process through secure environment
+injection before launch. The orchestrator fails preflight before starting the
+run if the key or AXLE client is unavailable; it does not silently downgrade
+to `off`.
 
 To get the PID after launch, run:
     ps aux | grep '[o]rchestrator.py.*<problem-id>'
