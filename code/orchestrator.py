@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import signal
+import shutil
 import sys
 import subprocess
 import re
@@ -44,6 +45,8 @@ from prompts import (
     empirical_probe_prompt,
     cas_verify_prompt,
     cas_compute_prompt,
+    lean_formalize_prompt,
+    lean_repair_prompt,
     verification_system_prompt,
     verification_reminder,
     classifier_prompt,
@@ -71,6 +74,10 @@ VALIDATION_TIMEOUT = 60  # seconds for executing empirical/CAS validation script
 VALIDATION_MAX_TOKENS = 65536  # token budget for validation code generation
 VALIDATION_THINKING_BUDGET = 4096  # thinking budget for validation code generation
 CAS_MAX_RETRIES = 1  # max CORRECT retry when CAS verification fails
+LEAN_TIMEOUT = 300
+LEAN_MAX_REPAIRS = 1
+LEAN_MAX_TOKENS = 128_000
+LEAN_THINKING_BUDGET = 64_000
 
 # Wall-clock timeout per API call. Uses threading.Timer (not signal.alarm)
 # because signal.alarm delivery is delayed by 500+ seconds on macOS when the
@@ -360,7 +367,7 @@ def extract_section(text, marker, after=True):
     return text[:idx].strip()
 
 
-def build_verifier_messages(problem, solution):
+def build_verifier_messages(problem, solution, formal_report=None):
     detailed = extract_section(solution, "Detailed Solution")
     if not detailed:
         detailed = solution.strip()
@@ -368,8 +375,17 @@ def build_verifier_messages(problem, solution):
         verification_system_prompt.strip() + DNL
         + DIV + "### Problem ###" + DNL + problem.strip() + DNL
         + DIV + "### Solution ###" + DNL + detailed + DNL
-        + verification_reminder.strip()
     )
+    if formal_report:
+        user += (
+            DIV + "### Local Lean Formalization Report ###" + DNL
+            + formal_report.strip() + DNL
+            + "A Lean compiler pass proves only the encoded theorem. Check that "
+            + "`imo_problem` faithfully states the entire natural-language problem; "
+            + "flag any weakened, altered, or incomplete formalization as a Critical Error."
+            + DNL
+        )
+    user += verification_reminder.strip()
     return [
         {"role": "system", "content": "You are an expert IMO grader. Follow the instructions exactly."},
         {"role": "user", "content": user},
@@ -409,6 +425,40 @@ def build_refinement_messages(problem, solution, verification):
     ]
 
 
+def build_lean_formalization_messages(problem, solution):
+    return [
+        {
+            "role": "system",
+            "content": "You are an expert Lean 4 and Mathlib formalizer. Output Lean source only.",
+        },
+        {
+            "role": "user",
+            "content": (
+                lean_formalize_prompt.strip() + DNL + problem.strip() + DNL
+                + DIV + "### Informal Solution ###" + DNL + solution.strip()
+            ),
+        },
+    ]
+
+
+def build_lean_repair_messages(problem, solution, lean_source, report):
+    return [
+        {
+            "role": "system",
+            "content": "You are an expert Lean 4 and Mathlib proof engineer. Output Lean source only.",
+        },
+        {
+            "role": "user",
+            "content": (
+                lean_repair_prompt.strip() + DNL + problem.strip() + DNL
+                + DIV + "### Informal Solution ###" + DNL + solution.strip() + DNL
+                + DIV + "### Broken Lean Source ###" + DNL + lean_source.strip() + DNL
+                + DIV + "### Local Lean Report ###" + DNL + report.strip()
+            ),
+        },
+    ]
+
+
 # -- Solver loop --
 
 def execute_python_code(code, timeout=VALIDATION_TIMEOUT):
@@ -442,6 +492,69 @@ def execute_python_code(code, timeout=VALIDATION_TIMEOUT):
             os.unlink(script_path)
         except OSError:
             pass
+
+
+def strip_code_fences(code):
+    lines = code.strip().splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def lean_policy_violations(code):
+    without_comments = re.sub(r"--.*?$|/-.*?-/", "", code, flags=re.MULTILINE | re.DOTALL)
+    violations = []
+    for token in ("sorry", "admit", "axiom", "opaque", "unsafe"):
+        if re.search(rf"\b{token}\b", without_comments):
+            violations.append(f"forbidden token: {token}")
+    if re.search(r"\bset_option\s+autoImplicit\s+true\b", without_comments):
+        violations.append("autoImplicit may not be enabled")
+    if not re.search(r"\btheorem\s+imo_problem\b", without_comments):
+        violations.append("missing theorem named imo_problem")
+    return violations
+
+
+def execute_lean_code(code, source_path, lean_project, timeout=LEAN_TIMEOUT):
+    """Compile a generated proof locally using elan/lake and reject proof holes."""
+    source = strip_code_fences(code)
+    source_path.write_text(source, encoding="utf-8")
+    violations = lean_policy_violations(source)
+    if violations:
+        return False, "Policy failure:\n" + "\n".join(f"- {item}" for item in violations)
+
+    lake = shutil.which("lake")
+    if not lake:
+        candidate = Path.home() / ".elan" / "bin" / "lake"
+        if candidate.is_file():
+            lake = str(candidate)
+    if not lake:
+        return False, "Local Lean unavailable: lake was not found. Run scripts/setup_lean.sh."
+    if not (lean_project / "lakefile.lean").is_file():
+        return False, f"Local Lean project unavailable: {lean_project / 'lakefile.lean'} not found."
+
+    try:
+        result = subprocess.run(
+            [lake, "env", "lean", str(source_path.resolve())],
+            cwd=lean_project,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Local Lean timeout after {timeout}s."
+    except OSError as exc:
+        return False, f"Local Lean execution error: {exc}"
+
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        return False, f"Local Lean failed (rc={result.returncode}):\n{output}"
+    if "declaration uses 'sorry'" in output:
+        return False, f"Local Lean rejected a proof hole:\n{output}"
+    return True, "Local Lean compiled `imo_problem` without proof holes." + (
+        "\nCompiler output:\n" + output if output else ""
+    )
 
 
 def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
@@ -742,7 +855,19 @@ def build_pivot_hint(failure_reason=None):
     return hint
 
 
-def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure_reason=None, empirical_results=None, failure_context=None):
+def run_outer(
+    outer_run,
+    problem,
+    api_url,
+    api_key,
+    model,
+    run_dir,
+    prev_failure_reason=None,
+    empirical_results=None,
+    failure_context=None,
+    lean_mode="required",
+    lean_project=None,
+):
     """Run one outer attempt. Returns (accepted, candidate, summary)."""
     subdir = run_dir / f"run_{outer_run:02d}"
     subdir.mkdir(exist_ok=True)
@@ -751,6 +876,7 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     candidate_num = 0
     verify_num = 0
     pass_artifacts = []
+    formal_cache = {}
 
     _reasoning_seq = [0]
     def call(messages, label, max_tokens=None, thinking_budget=None):
@@ -832,6 +958,64 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 return content2
         return content
 
+    def formal_check(current_candidate, current_candidate_num):
+        if lean_mode == "off":
+            return True, "Formal verification disabled by --lean-mode off.", None, None
+
+        cache_key = sha256_text(current_candidate)
+        if cache_key in formal_cache:
+            return formal_cache[cache_key]
+
+        label = f"CANDIDATE {current_candidate_num:02d}"
+        log_progress(run_dir, f"RUN {outer_run} {label} LEAN_FORMALIZE: start")
+        source = call(
+            build_lean_formalization_messages(problem, current_candidate),
+            f"{label} LEAN_FORMALIZE",
+            max_tokens=LEAN_MAX_TOKENS,
+            thinking_budget=LEAN_THINKING_BUDGET,
+        )
+        source_name = f"candidate_{current_candidate_num:02d}.lean"
+        source_path = subdir / source_name
+        local_ok, local_report = execute_lean_code(
+            source, source_path, lean_project, timeout=LEAN_TIMEOUT
+        )
+        passed = local_ok
+        report = local_report
+
+        if not passed and LEAN_MAX_REPAIRS:
+            log_progress(run_dir, f"RUN {outer_run} {label} LEAN_REPAIR: start")
+            source = call(
+                build_lean_repair_messages(
+                    problem, current_candidate, source, report
+                ),
+                f"{label} LEAN_REPAIR",
+                max_tokens=LEAN_MAX_TOKENS,
+                thinking_budget=LEAN_THINKING_BUDGET,
+            )
+            source_name = f"candidate_{current_candidate_num:02d}_lean_retry.lean"
+            source_path = subdir / source_name
+            local_ok, local_report = execute_lean_code(
+                source, source_path, lean_project, timeout=LEAN_TIMEOUT
+            )
+            passed = local_ok
+            report = local_report
+
+        status = "PASS" if passed else "FAIL"
+        report = (
+            f"Formal verification: {status} via local Lean." + DNL
+            + report + DNL + DIV + "### Lean Source ###" + DNL
+            + strip_code_fences(source)
+        )
+        report_name = f"lean_verify_{current_candidate_num:02d}.txt"
+        save_text(subdir, report_name, report)
+        log_progress(
+            run_dir,
+            f"RUN {outer_run} {label} LEAN_VERIFY: {status} via local Lean",
+        )
+        result = (passed, report, source_name, report_name)
+        formal_cache[cache_key] = result
+        return result
+
     # -- SOLVE --
     log_progress(run_dir, f"RUN {outer_run} SOLVE: start")
     pivot_hint = build_pivot_hint(prev_failure_reason) if outer_run > 1 else None
@@ -846,13 +1030,31 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
     save_text(subdir, "candidate_00.md", solution)
     candidate = solution
 
-    # -- Initial VERIFY + CLASSIFY --
+    # -- Initial LEAN_VERIFY + VERIFY + CLASSIFY --
+    formal_ok, formal_report, lean_source_name, lean_report_name = formal_check(
+        candidate, candidate_num
+    )
     log_progress(run_dir, f"RUN {outer_run} VERIFY: initial")
-    verification = call(build_verifier_messages(problem, candidate), "VERIFY")
+    verification = call(
+        build_verifier_messages(problem, candidate, formal_report), "VERIFY"
+    )
+    if lean_mode == "required" and not formal_ok:
+        verification += (
+            DNL + DIV + "### Required Local Lean Gate Failure ###" + DNL
+            + "The candidate cannot be accepted until local Lean verifies a "
+            + "faithful formalization of the full problem." + DNL
+            + formal_report
+        )
     save_text(subdir, f"verify_{verify_num:02d}.md", verification)
 
     log_progress(run_dir, f"RUN {outer_run} CLASSIFY: initial")
     classification = call(build_classifier_messages(verification), "CLASSIFY")
+    if lean_mode == "required" and not formal_ok and is_standalone_yes(classification):
+        classification = "no"
+        log_progress(
+            run_dir,
+            f"RUN {outer_run} CLASSIFY: overridden to no by required Lean gate",
+        )
     save_text(subdir, f"classify_{verify_num:02d}.md", classification)
     verify_num += 1
 
@@ -870,6 +1072,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
             "candidate": f"candidate_{candidate_num:02d}.md",
             "verify": f"verify_{verify_num - 1:02d}.md",
             "classify": f"classify_{verify_num - 1:02d}.md",
+            "lean_source": lean_source_name,
+            "lean_report": lean_report_name,
         })
         log_progress(run_dir, f"RUN {outer_run} initial PASS (1/{REQUIRED_PASSES})")
     elif is_standalone_improve(good_verify):
@@ -963,12 +1167,22 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                         candidate_num += 1
                         save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
 
-        # VERIFY
+        # LEAN_VERIFY + VERIFY
+        formal_ok, formal_report, lean_source_name, lean_report_name = formal_check(
+            candidate, candidate_num
+        )
         log_progress(run_dir, f"RUN {outer_run} ITER {i+1} VERIFY: start")
         verification = call(
-            build_verifier_messages(problem, candidate),
+            build_verifier_messages(problem, candidate, formal_report),
             f"ITER {i+1} VERIFY",
         )
+        if lean_mode == "required" and not formal_ok:
+            verification += (
+                DNL + DIV + "### Required Local Lean Gate Failure ###" + DNL
+                + "The candidate cannot be accepted until local Lean verifies a "
+                + "faithful formalization of the full problem." + DNL
+                + formal_report
+            )
         save_text(subdir, f"verify_{verify_num:02d}.md", verification)
 
         # Core Fix B: Track error locations for structural error detection
@@ -980,6 +1194,12 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
             build_classifier_messages(verification),
             f"ITER {i+1} CLASSIFY",
         )
+        if lean_mode == "required" and not formal_ok and is_standalone_yes(classification):
+            classification = "no"
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} ITER {i+1} CLASSIFY: overridden to no by required Lean gate",
+            )
         save_text(subdir, f"classify_{verify_num:02d}.md", classification)
         verify_num += 1
 
@@ -995,6 +1215,8 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 "candidate": f"candidate_{candidate_num:02d}.md",
                 "verify": f"verify_{verify_num - 1:02d}.md",
                 "classify": f"classify_{verify_num - 1:02d}.md",
+                "lean_source": lean_source_name,
+                "lean_report": lean_report_name,
             })
             log_progress(
                 run_dir,
@@ -1040,7 +1262,9 @@ def run_outer(outer_run, problem, api_url, api_key, model, run_dir, prev_failure
                 return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
 
         # Check thresholds
-        if correct_count >= REQUIRED_PASSES:
+        if correct_count >= REQUIRED_PASSES and (
+            lean_mode != "required" or formal_ok
+        ):
             log_progress(
                 run_dir,
                 f"RUN {outer_run} ACCEPTED: {REQUIRED_PASSES} consecutive passes",
@@ -1107,6 +1331,18 @@ def main():
     parser.add_argument(
         "--model", default=os.getenv("IMO_SOLVER_MODEL", "")
     )
+    parser.add_argument(
+        "--lean-mode",
+        choices=("required", "best-effort", "off"),
+        default=os.getenv("IMO_LEAN_MODE", "required"),
+        help="Local Lean policy. Default: required.",
+    )
+    parser.add_argument(
+        "--lean-project",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent / "lean",
+        help="Lake project containing the pinned local Mathlib environment.",
+    )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -1117,6 +1353,17 @@ def main():
         parser.error("--api-key or IMO_SOLVER_TOKEN is required")
     if not args.model:
         parser.error("--model or IMO_SOLVER_MODEL is required")
+    args.lean_project = args.lean_project.resolve()
+    if args.lean_mode != "off":
+        if not (args.lean_project / "lakefile.lean").is_file():
+            parser.error(
+                f"local Lean project not initialized: {args.lean_project}; "
+                "run scripts/setup_lean.sh"
+            )
+        if not shutil.which("lake") and not (
+            Path.home() / ".elan" / "bin" / "lake"
+        ).is_file():
+            parser.error("local Lean not installed; run scripts/setup_lean.sh")
 
     problem = args.problem.read_text(encoding="utf-8")
     args.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1152,7 +1399,8 @@ def main():
 
     log_progress(
         args.run_dir,
-        f"ORCHESTRATOR START: problem={args.problem.name} model={args.model}",
+        f"ORCHESTRATOR START: problem={args.problem.name} model={args.model} "
+        f"lean_mode={args.lean_mode}",
     )
 
     last_failure_reason = None
@@ -1182,6 +1430,8 @@ def main():
                 prev_failure_reason=last_failure_reason,
                 empirical_results=empirical_results,
                 failure_context=failure_context,
+                lean_mode=args.lean_mode,
+                lean_project=args.lean_project,
             )
             consecutive_infra_errors = 0
         except InfrastructureError as exc:
@@ -1246,6 +1496,7 @@ def main():
                 "outer_run": outer_run,
                 "total_tokens": summary.get("total_tokens", 0),
                 "pass_artifacts": summary.get("pass_artifacts", []),
+                "lean_mode": args.lean_mode,
                 "timestamp": now_utc(),
             }
             (args.run_dir / "manifest.json").write_text(

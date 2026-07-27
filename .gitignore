@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 .env
 .venv
+lean/.lake/
 solutions/
 /tmp/
 *.log

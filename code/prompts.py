@@ -175,3 +175,33 @@ Keep the code under 150 lines. Output only the Python code, no explanations or m
 
 ### Solution ###
 """
+
+lean_formalize_prompt = """
+Formalize and prove the supplied olympiad problem in Lean 4 using Mathlib.
+
+Requirements:
+- Output only a self-contained Lean source file, without markdown fences
+- Begin with `import Mathlib`
+- State the full problem faithfully as one theorem named `imo_problem`
+- Prove `imo_problem`; do not weaken, replace, or assume its conclusion
+- You may add proved helper lemmas
+- Do not use `sorry`, `admit`, `axiom`, `opaque`, `unsafe`, or any undeclared hypothesis
+- Keep the formal statement readable enough to compare against the natural-language problem
+- The supplied informal solution is guidance, not an authority; correct formal errors you notice
+
+### Problem ###
+"""
+
+lean_repair_prompt = """
+Repair the supplied Lean 4 formalization so that it compiles locally with Mathlib and remains
+a faithful formalization of the entire problem.
+
+Requirements:
+- Output only the complete repaired Lean source file, without markdown fences
+- Preserve the theorem name `imo_problem`
+- Do not weaken or replace the theorem statement to make the proof easier
+- Do not use `sorry`, `admit`, `axiom`, `opaque`, `unsafe`, or undeclared hypotheses
+- Address every compiler or policy error in the report
+
+### Problem ###
+"""
