@@ -43,13 +43,13 @@ running as an orphan — run scripts/cleanup.sh to find stale processes.
 
 Run this command via exec_command (yield_time_ms=3000):
 
-    python3 /Users/sonln4/IMO26/code/orchestrator.py \
-      --problem /Users/sonln4/IMO26/problems/<problem-file> \
+    python3 code/orchestrator.py \
+      --problem problems/<problem-file> \
       --api-url <endpoint> \
       --api-key <token> \
       --model <model> \
       --run-dir <run-dir> \
-      --output /Users/sonln4/IMO26/solutions/<problem-id>.md \
+      --output solutions/<problem-id>.md \
       > <run-dir>/stdout.log 2> <run-dir>/stderr.log
 
 The exec_command call returns a session_id immediately (the process is still
