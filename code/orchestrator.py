@@ -15,7 +15,8 @@ Usage:
         --run-dir /tmp/imo26-run \
         --output solutions/imo2026_p1.md
 
-Environment fallbacks: IMO_SOLVER_API_URL, IMO_SOLVER_TOKEN, IMO_SOLVER_MODEL
+Environment fallbacks: IMO_SOLVER_API_URL, IMO_SOLVER_TOKEN, IMO_SOLVER_MODEL,
+IMO_LEAN_MODE, IMO_AXLE_MODE, AXLE_API_KEY, AXLE_ENVIRONMENT
 
 """
 
@@ -557,6 +558,68 @@ def execute_lean_code(code, source_path, lean_project, timeout=LEAN_TIMEOUT):
     )
 
 
+def formal_backends_pass(local_ok, axle_ok, axle_mode):
+    if axle_mode == "required":
+        return local_ok and axle_ok is True
+    if axle_mode == "fallback":
+        return local_ok or axle_ok is True
+    return local_ok
+
+
+def execute_axle_check(code, environment, timeout=LEAN_TIMEOUT):
+    """Verify Lean source using AXLE. The caller must explicitly enable cloud use."""
+    source = strip_code_fences(code)
+    violations = lean_policy_violations(source)
+    if violations:
+        return False, "AXLE policy failure:\n" + "\n".join(
+            f"- {item}" for item in violations
+        )
+
+    try:
+        import asyncio
+        from axle import AxleClient
+    except ImportError:
+        return False, "AXLE unavailable: install requirements-axle.txt."
+
+    api_key = os.getenv("AXLE_API_KEY")
+    if not api_key:
+        return False, "AXLE unavailable: AXLE_API_KEY is not set."
+
+    async def check():
+        async with AxleClient(api_key=api_key) as client:
+            return await client.check(
+                content=source,
+                environment=environment,
+                ignore_imports=False,
+                timeout_seconds=timeout,
+            )
+
+    try:
+        result = asyncio.run(check())
+    except Exception as exc:
+        details = str(exc).replace(api_key, "<redacted>")
+        return False, f"AXLE request failed: {type(exc).__name__}: {details}"
+
+    failed = [str(item) for item in (result.failed_declarations or [])]
+    errors = [str(item) for item in result.lean_messages.errors]
+    warnings = [str(item) for item in result.lean_messages.warnings]
+    tool_errors = [str(item) for item in result.tool_messages.errors]
+    tool_warnings = [str(item) for item in result.tool_messages.warnings]
+    report = json.dumps(
+        {
+            "okay": result.okay,
+            "failed_declarations": failed,
+            "lean_errors": errors,
+            "lean_warnings": warnings,
+            "tool_errors": tool_errors,
+            "tool_warnings": tool_warnings,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    return bool(result.okay and not failed), report
+
+
 def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
     """Core Fix A: Generate and execute a validation script that computes
     small cases before SOLVE. Returns the computational results as a string,
@@ -867,8 +930,13 @@ def run_outer(
     failure_context=None,
     lean_mode="required",
     lean_project=None,
+    axle_mode="off",
+    axle_environment="lean-4.28.0",
 ):
     """Run one outer attempt. Returns (accepted, candidate, summary)."""
+    if lean_mode == "off" and axle_mode != "off":
+        raise ValueError("AXLE requires local Lean formalization")
+
     subdir = run_dir / f"run_{outer_run:02d}"
     subdir.mkdir(exist_ok=True)
 
@@ -877,6 +945,7 @@ def run_outer(
     verify_num = 0
     pass_artifacts = []
     formal_cache = {}
+    formal_gate_required = lean_mode == "required" or axle_mode == "required"
 
     _reasoning_seq = [0]
     def call(messages, label, max_tokens=None, thinking_budget=None):
@@ -976,11 +1045,34 @@ def run_outer(
         )
         source_name = f"candidate_{current_candidate_num:02d}.lean"
         source_path = subdir / source_name
-        local_ok, local_report = execute_lean_code(
-            source, source_path, lean_project, timeout=LEAN_TIMEOUT
-        )
-        passed = local_ok
-        report = local_report
+
+        def check_backends(lean_source, lean_source_path):
+            local_ok, local_report = execute_lean_code(
+                lean_source, lean_source_path, lean_project, timeout=LEAN_TIMEOUT
+            )
+            axle_ok = None
+            axle_report = "AXLE not requested."
+            if axle_mode == "required" or (
+                axle_mode == "fallback" and not local_ok
+            ):
+                axle_ok, axle_report = execute_axle_check(
+                    lean_source, axle_environment, timeout=LEAN_TIMEOUT
+                )
+            passed = formal_backends_pass(local_ok, axle_ok, axle_mode)
+            combined_report = (
+                f"Local Lean: {'PASS' if local_ok else 'FAIL'}" + DNL
+                + local_report + DNL + DIV
+                + f"AXLE ({axle_mode}): "
+                + (
+                    "SKIPPED"
+                    if axle_ok is None
+                    else ("PASS" if axle_ok else "FAIL")
+                )
+                + DNL + axle_report
+            )
+            return passed, local_ok, axle_ok, combined_report
+
+        passed, local_ok, axle_ok, report = check_backends(source, source_path)
 
         if not passed and LEAN_MAX_REPAIRS:
             log_progress(run_dir, f"RUN {outer_run} {label} LEAN_REPAIR: start")
@@ -994,15 +1086,14 @@ def run_outer(
             )
             source_name = f"candidate_{current_candidate_num:02d}_lean_retry.lean"
             source_path = subdir / source_name
-            local_ok, local_report = execute_lean_code(
-                source, source_path, lean_project, timeout=LEAN_TIMEOUT
+            passed, local_ok, axle_ok, report = check_backends(
+                source, source_path
             )
-            passed = local_ok
-            report = local_report
 
         status = "PASS" if passed else "FAIL"
         report = (
-            f"Formal verification: {status} via local Lean." + DNL
+            f"Formal verification: {status} "
+            f"(local Lean with AXLE mode {axle_mode})." + DNL
             + report + DNL + DIV + "### Lean Source ###" + DNL
             + strip_code_fences(source)
         )
@@ -1010,7 +1101,9 @@ def run_outer(
         save_text(subdir, report_name, report)
         log_progress(
             run_dir,
-            f"RUN {outer_run} {label} LEAN_VERIFY: {status} via local Lean",
+            f"RUN {outer_run} {label} LEAN_VERIFY: {status} "
+            f"(local={'PASS' if local_ok else 'FAIL'}, "
+            f"axle={'SKIP' if axle_ok is None else ('PASS' if axle_ok else 'FAIL')})",
         )
         result = (passed, report, source_name, report_name)
         formal_cache[cache_key] = result
@@ -1038,22 +1131,23 @@ def run_outer(
     verification = call(
         build_verifier_messages(problem, candidate, formal_report), "VERIFY"
     )
-    if lean_mode == "required" and not formal_ok:
+    if formal_gate_required and not formal_ok:
         verification += (
-            DNL + DIV + "### Required Local Lean Gate Failure ###" + DNL
-            + "The candidate cannot be accepted until local Lean verifies a "
-            + "faithful formalization of the full problem." + DNL
+            DNL + DIV + "### Required Formal Verification Gate Failure ###" + DNL
+            + "The candidate cannot be accepted until the configured formal "
+            + "verification backends verify a faithful formalization of the "
+            + "full problem." + DNL
             + formal_report
         )
     save_text(subdir, f"verify_{verify_num:02d}.md", verification)
 
     log_progress(run_dir, f"RUN {outer_run} CLASSIFY: initial")
     classification = call(build_classifier_messages(verification), "CLASSIFY")
-    if lean_mode == "required" and not formal_ok and is_standalone_yes(classification):
+    if formal_gate_required and not formal_ok and is_standalone_yes(classification):
         classification = "no"
         log_progress(
             run_dir,
-            f"RUN {outer_run} CLASSIFY: overridden to no by required Lean gate",
+            f"RUN {outer_run} CLASSIFY: overridden to no by required formal gate",
         )
     save_text(subdir, f"classify_{verify_num:02d}.md", classification)
     verify_num += 1
@@ -1176,11 +1270,12 @@ def run_outer(
             build_verifier_messages(problem, candidate, formal_report),
             f"ITER {i+1} VERIFY",
         )
-        if lean_mode == "required" and not formal_ok:
+        if formal_gate_required and not formal_ok:
             verification += (
-                DNL + DIV + "### Required Local Lean Gate Failure ###" + DNL
-                + "The candidate cannot be accepted until local Lean verifies a "
-                + "faithful formalization of the full problem." + DNL
+                DNL + DIV + "### Required Formal Verification Gate Failure ###" + DNL
+                + "The candidate cannot be accepted until the configured formal "
+                + "verification backends verify a faithful formalization of the "
+                + "full problem." + DNL
                 + formal_report
             )
         save_text(subdir, f"verify_{verify_num:02d}.md", verification)
@@ -1194,11 +1289,11 @@ def run_outer(
             build_classifier_messages(verification),
             f"ITER {i+1} CLASSIFY",
         )
-        if lean_mode == "required" and not formal_ok and is_standalone_yes(classification):
+        if formal_gate_required and not formal_ok and is_standalone_yes(classification):
             classification = "no"
             log_progress(
                 run_dir,
-                f"RUN {outer_run} ITER {i+1} CLASSIFY: overridden to no by required Lean gate",
+                f"RUN {outer_run} ITER {i+1} CLASSIFY: overridden to no by required formal gate",
             )
         save_text(subdir, f"classify_{verify_num:02d}.md", classification)
         verify_num += 1
@@ -1263,7 +1358,7 @@ def run_outer(
 
         # Check thresholds
         if correct_count >= REQUIRED_PASSES and (
-            lean_mode != "required" or formal_ok
+            not formal_gate_required or formal_ok
         ):
             log_progress(
                 run_dir,
@@ -1343,6 +1438,20 @@ def main():
         default=Path(__file__).resolve().parent.parent / "lean",
         help="Lake project containing the pinned local Mathlib environment.",
     )
+    parser.add_argument(
+        "--axle-mode",
+        choices=("off", "fallback", "required"),
+        default=os.getenv("IMO_AXLE_MODE", "off"),
+        help=(
+            "Hosted AXLE policy: off (default), fallback when local Lean fails, "
+            "or required in addition to local Lean."
+        ),
+    )
+    parser.add_argument(
+        "--axle-environment",
+        default=os.getenv("AXLE_ENVIRONMENT", "lean-4.28.0"),
+        help="AXLE Lean environment name. Default: lean-4.28.0.",
+    )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -1353,6 +1462,17 @@ def main():
         parser.error("--api-key or IMO_SOLVER_TOKEN is required")
     if not args.model:
         parser.error("--model or IMO_SOLVER_MODEL is required")
+    if args.axle_mode != "off":
+        if args.lean_mode == "off":
+            parser.error("--axle-mode requires local Lean formalization")
+        if not os.getenv("AXLE_API_KEY"):
+            parser.error("AXLE_API_KEY is required when --axle-mode is enabled")
+        try:
+            __import__("axle")
+        except ImportError:
+            parser.error(
+                "AXLE client unavailable; install requirements-axle.txt"
+            )
     args.lean_project = args.lean_project.resolve()
     if args.lean_mode != "off":
         if not (args.lean_project / "lakefile.lean").is_file():
@@ -1400,7 +1520,8 @@ def main():
     log_progress(
         args.run_dir,
         f"ORCHESTRATOR START: problem={args.problem.name} model={args.model} "
-        f"lean_mode={args.lean_mode}",
+        f"lean_mode={args.lean_mode} axle_mode={args.axle_mode} "
+        f"axle_environment={args.axle_environment}",
     )
 
     last_failure_reason = None
@@ -1432,6 +1553,8 @@ def main():
                 failure_context=failure_context,
                 lean_mode=args.lean_mode,
                 lean_project=args.lean_project,
+                axle_mode=args.axle_mode,
+                axle_environment=args.axle_environment,
             )
             consecutive_infra_errors = 0
         except InfrastructureError as exc:
@@ -1497,6 +1620,8 @@ def main():
                 "total_tokens": summary.get("total_tokens", 0),
                 "pass_artifacts": summary.get("pass_artifacts", []),
                 "lean_mode": args.lean_mode,
+                "axle_mode": args.axle_mode,
+                "axle_environment": args.axle_environment,
                 "timestamp": now_utc(),
             }
             (args.run_dir / "manifest.json").write_text(

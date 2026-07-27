@@ -55,6 +55,22 @@ Run this command via exec_command (yield_time_ms=3000):
 The exec_command call returns a session_id immediately (the process is still
 running). Save this session_id for monitoring with write_stdin.
 
+### Optional hosted AXLE verification
+
+Local Lean is the default and AXLE is disabled unless a mode is explicitly
+selected. Install the optional client from `requirements-axle.txt`, inject
+`AXLE_API_KEY` into the orchestrator process environment without printing or
+persisting it, and add one of:
+
+    --axle-mode fallback
+    --axle-mode required
+
+`fallback` calls AXLE only after local Lean fails, and either backend may
+satisfy the formal gate. `required` calls AXLE for every formalization and
+requires both backends to pass. Use `--axle-environment <name>` to override the
+default hosted environment (`lean-4.28.0`). Never put the AXLE key in a command
+line or run artifact.
+
 ## First check after launch
 
 CRITICAL: Wait 30 seconds after launch, then check these files:

@@ -46,7 +46,8 @@ Each iteration:
 7. CORRECT - if classified no, use the report to fix the proof
 
 Five consecutive yes classifications on an unchanged candidate accepts it,
-and the default `--lean-mode required` additionally requires a local Lean pass.
+and the default `--lean-mode required --axle-mode off` additionally requires a
+local Lean pass.
 Generated `.lean` sources and compiler reports are saved in each run directory.
 Three correction failures or 30 iterations fails the outer run.
 Up to 10 fresh outer runs are attempted.
@@ -61,10 +62,30 @@ from the environment or command line; never from the repo.
 Formal verification modes:
 
 - `--lean-mode required` (default): a candidate cannot be accepted without a
-  local Lean pass.
+  formal pass. With AXLE off, this means a local Lean pass.
 - `--lean-mode best-effort`: always attempt Lean and feed its report to the
   verifier, but do not make compilation an acceptance gate.
 - `--lean-mode off`: explicitly disable Lean.
+
+Hosted AXLE verification is optional and off by default. Enabling it sends the
+generated Lean source to Axiom's service. The optional client requires
+Python 3.11 or newer:
+
+```sh
+python3 -m pip install -r requirements-axle.txt
+export AXLE_API_KEY="<your AXLE key>"
+python3 code/orchestrator.py ... --axle-mode fallback
+```
+
+- `--axle-mode off` (default): never contact AXLE.
+- `--axle-mode fallback`: contact AXLE only when local Lean fails; either
+  backend may satisfy the formal gate.
+- `--axle-mode required`: contact AXLE for every formalization and require both
+  local Lean and AXLE to pass.
+- `--axle-environment lean-4.28.0`: select the hosted Lean environment.
+
+The AXLE key is accepted only through `AXLE_API_KEY`; there is deliberately no
+key command-line flag, and the key is never written to run artifacts.
 
 ## License
 

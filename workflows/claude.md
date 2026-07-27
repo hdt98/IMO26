@@ -56,6 +56,22 @@ Set run_in_background: true in the Bash tool call. Do NOT use nohup, &, or
 screen - run_in_background: true provides proper task tracking and process
 management. Save the backgroundTaskId, the PID, and the run directory path.
 
+### Optional hosted AXLE verification
+
+Local Lean is the default and AXLE is disabled unless a mode is explicitly
+selected. Install the optional client from `requirements-axle.txt`, inject
+`AXLE_API_KEY` into the orchestrator process environment without printing or
+persisting it, and add one of:
+
+    --axle-mode fallback
+    --axle-mode required
+
+`fallback` calls AXLE only after local Lean fails, and either backend may
+satisfy the formal gate. `required` calls AXLE for every formalization and
+requires both backends to pass. Use `--axle-environment <name>` to override the
+default hosted environment (`lean-4.28.0`). Never put the AXLE key in a command
+line or run artifact.
+
 To get the PID after launch, run:
     ps aux | grep '[o]rchestrator.py.*<problem-id>'
 
