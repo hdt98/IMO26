@@ -8,11 +8,11 @@ Authoritative problem file: problems/imo2026_p2.txt
 
 Read the workflow contract completely before acting and follow it exactly.
 
-Credentials - Direct IP endpoint:
-  - API URL: http://165.245.166.41:30000/v1/chat/completions
-  - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
-  - Model: GLM-5.2-FP8
-Never print or persist the token value.
+Credentials come only from the inherited environment:
+  - IMO_SOLVER_API_URL
+  - IMO_SOLVER_TOKEN
+  - IMO_SOLVER_MODEL
+Never print, persist, or put the token on a command line.
 
 Formal verification policy for this run:
   - Keep the formal gate required with `--lean-mode required`; local Lean
@@ -26,8 +26,8 @@ If `AXLE_API_KEY` or the AXLE client is unavailable, stop and report that
 before launch; do not silently disable AXLE or weaken the formal gate.
 
 Launch the orchestrator directly via exec_command (NOT screen). The process
-runs as a child of the Codex app-server. Always pass --api-url, --api-key,
-and --model explicitly as command-line arguments. Redirect stdout and stderr
+runs as a child of the Codex app-server. Let the orchestrator read its model
+configuration from the inherited environment. Redirect stdout and stderr
 to files in the run directory. The exec_command call returns a session_id -
 save it for monitoring with write_stdin.
 
@@ -42,36 +42,40 @@ yield_time_ms=300000) to detect completion, and separate exec_command calls
 to check tail -5 progress.log and cat state.json. Poll no more than once
 every 5 minutes. Only report when an iteration completes or an error occurs.
 
-When an iteration completes (VERIFY or CLASSIFY), read the latest artifacts
-from the run_XX/ subdirectory in the run directory to report substantively:
-  - cat <run-dir>/run_XX/classify_YY.md — the classification verdict (yes/improve/no)
-  - head -30 <run-dir>/run_XX/verify_YY.md — key findings from the verification
-  - cat the latest <run-dir>/run_XX/lean_verify_NN.txt — the formal gate,
+When a VERIFY stage completes, read the latest artifacts from the run_XX/
+subdirectory and report substantively:
+  - cat <run-dir>/run_XX/classify_YY.md — the verifier's derived machine verdict
+  - cat <run-dir>/run_XX/verify_YY.json — audit, candidate hash, and frozen
+    statement hash
+  - head -30 <run-dir>/run_XX/verify_YY.md — key audit findings
+  - cat the latest <run-dir>/run_XX/candidate_NN_statement_frozen.lean —
+    the exact statement reviewed before proof generation, when present
+  - cat the latest <run-dir>/run_XX/lean_verify_NN_attempt_AA.txt — the formal gate,
     including local Lean and AXLE PASS/FAIL/SKIP status
 Summarize what the verifier found (critical errors, justification gaps) and
-what the classifier decided. State whether the formalization passed and whether
-the verifier judged `imo_problem` faithful to the natural-language problem.
+its final `VERDICT: yes|improve|no`. State whether the formalization passed and
+whether the verifier judged `imo_problem` faithful to the original problem.
 Do not just report token counts — explain what happened mathematically and what
 the next step is trying to fix. Keep the summary concise but substantive.
 
 The orchestrator has built-in protections that work without agent
 intervention: a wall-clock timeout (threading.Timer, 5400s per API call) that
-prevents hung processes, infrastructure error detection with exponential
-backoff (waits instead of burning through runs when endpoint is down), a
-lock file that prevents duplicate runs for the same problem, a three-tier
-classifier (yes/improve/no) that distinguishes minor gaps from critical
-errors, and a pivot mechanism (3 consecutive failures triggers a fresh
-SOLVE with a different-approach hint).
+preserves partial reasoning/output for a bounded continuation, infrastructure
+error backoff that retries the same outer run, an atomic per-output lock,
+sandboxed generated-code execution, fail-closed machine verdicts, exact
+candidate- and frozen-statement-hash tracking, and a pivot after 3 critical
+failures. The acceptance sequence is proof_logic -> LEAN_STATEMENT ->
+statement_fidelity -> freeze exact prefix -> LEAN_FORMALIZE/local Lean/AXLE ->
+computation. A rejected statement is redrafted without mutating the informal
+proof; proof generation and repair may not alter a frozen prefix.
 Do not interfere with these mechanisms.
-
-Note: state.json may show stale consecutive_passes values because it is
-saved before the reset logic runs. The actual in-memory values are correct.
 
 This must be a fresh, independent run. Do not read prior solutions, run
 logs, verification reports, scratch work, or artifacts. The Desktop parent
 is an orchestrator only and may not solve or grade the mathematics. Keep
 the Goal active until the background workflow either persists a candidate
-that earns five consecutive independent passes and passes the configured
+that passes all three distinct audits on one unchanged candidate SHA-256 and
+one unchanged frozen-statement SHA-256, and passes the configured
 formal-verification gate, or records a legitimate terminal failure.
 
 Do not interpret a UI wait timeout as a stream failure, do not silently

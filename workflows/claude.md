@@ -1,261 +1,172 @@
-# Direct solver workflow for Claude Code
+# Claude Code workflow
 
-This workflow lets Claude Code launch and monitor a durable background solver.
-The Desktop agent is an orchestrator only; it must not solve, grade, or rewrite
-the mathematics itself.
+Claude Code launches and monitors the durable solver. It does not solve,
+grade, or rewrite the olympiad proof itself. The mathematical state machine is
+the same as the Codex workflow; only process launch and monitoring differ.
+
+## Solver state machine
+
+1. `EMPIRICAL_PROBE` optionally creates a small-case Python program. The
+   orchestrator policy-checks and runs it in an OS sandbox. Its stdout is
+   untrusted evidence passed to `SOLVE`.
+2. `SOLVE` creates the informal candidate.
+3. In the default `--self-improve recovery` mode, `SELF_IMPROVE` runs only when
+   SOLVE is empty, truncated, or structurally incomplete. It receives the full
+   solver context and partial output. `always` forces a complete independent
+   review, while `off` disables the stage.
+4. `CAS_VERIFY` may produce sandboxed computational evidence; it never edits
+   or proves the candidate by itself.
+5. `proof_logic` audits the complete informal proof. A clean result unlocks
+   statement translation.
+6. `LEAN_STATEMENT` drafts only an `imo_problem ... := by` prefix.
+   `statement_fidelity` checks its quantifiers, domains, hypotheses, and
+   conclusion against the original problem. Rejection redrafts only the
+   statement; a pass freezes its exact bytes and SHA-256.
+7. `LEAN_FORMALIZE` and `LEAN_REPAIR` may add or change only the proof body.
+   A prefix change is rejected before execution. Local Lean checks the
+   declaration, elaborated statement hash, and axioms in an OS sandbox.
+8. AXLE is an optional hosted checker for that same Lean source. `fallback`
+   calls it only when local Lean fails; `required` requires both backends.
+9. `computation` audits all algebraic/computational evidence and final
+   consistency with the frozen statement and formal report.
+10. `VERDICT: improve` refines the proof and `VERDICT: no` corrects it. Either
+   mutation clears every pass, formal result, and hash-bound artifact.
+11. Acceptance requires all three audits on one candidate SHA-256 and one
+    frozen-statement SHA-256, plus the selected formal gate.
+
+There is no independent classifier call. `classify_NN.md` is the parsed final
+verdict line from `verify_NN.md`; malformed or absent verdicts become `no`.
+Formalization failures receive separate retries so a translation failure is
+not confused with a mathematical error.
 
 ## Setup
 
-1. Read the problem file from problems/.
-2. Read code/prompts.py and code/orchestrator.py to understand the algorithm.
-3. Create a fresh run directory: /tmp/imo26-<problem-id>-<UTC-timestamp>.
+```sh
+python3 -m pip install -r requirements.txt
+bash scripts/setup_lean.sh
 
-## Transport
+export IMO_SOLVER_API_URL="https://model-host/v1/chat/completions"
+export IMO_SOLVER_TOKEN="..."
+export IMO_SOLVER_MODEL="..."
+```
 
-The orchestrator makes OpenAI-compatible chat completion calls directly to the
-configured model endpoint. It reads credentials from command-line flags:
+Optionally set `IMO_VERIFIER_MODEL`. Do not put credentials in prompts,
+source files, artifacts, or command lines. A mode-0600 `--api-key-file` is the
+only supported file alternative to `IMO_SOLVER_TOKEN`.
 
-- --api-url  - the chat completions endpoint
-- --api-key  - bearer token
-- --model    - model name
+For optional AXLE:
 
-Direct IP endpoint:
-    - API URL: http://165.245.166.41:30000/v1/chat/completions
-    - Token: onenx-dev-JgZ0YeSTHeTVh057uomgjF02
-    - Model: GLM-5.2-FP8
+```sh
+python3 -m pip install -r requirements-axle.txt
+export AXLE_API_KEY="..."
+```
 
-Never print or persist the token in source files.
+The AXLE client currently requires Python 3.11 or newer.
 
-The orchestrator already encodes max_tokens=256000 with thinking_budget=200000,
-a 5400-second HTTP timeout, a 5400-second wall-clock timeout (threading.Timer),
-and no more than three transport retries. These values are proven from
-the P3 run: the solver used 124650 reasoning tokens out of the 200000 budget
-and completed normally with finish_reason=stop.
+AXLE receives generated Lean source through Axiom's hosted service. It does not
+run `SOLVE`, the empirical probe, CAS checks, or mathematical verification.
 
-The orchestrator uses streaming mode (stream=True) with SSE chunk parsing
-and stream_options={"include_usage": true} to capture token counts. Streaming
-keeps the connection alive during long generation (20-60 min per SOLVE call)
-and prevents the server from closing idle non-streaming connections.
+Generated Python and Lean execution requires macOS `sandbox-exec`. The
+orchestrator has no unsandboxed execution fallback. Disabling both validation
+and Lean is supported for portability but is not equivalent assurance.
 
-## Launch (run_in_background - no nohup, no screen)
+## Launch
 
-Launch the orchestrator using the Bash tool with run_in_background: true.
-This gives Claude Code a backgroundTaskId for tracking and writes output to
-a managed file. The process survives session stops by design - this is
-desired for long-running orchestrator runs that may take 30+ minutes.
+Create a fresh run directory and launch with the Bash tool's
+`run_in_background: true`. Do not use `nohup`, `&`, or `screen`.
 
-    python3 code/orchestrator.py \
-        --problem problems/imo2026_p1.txt \
-        --api-url "$API_URL" \
-        --api-key "$API_KEY" \
-        --model "$MODEL_NAME" \
-        --lean-mode required \
-        --axle-mode fallback \
-        --axle-environment lean-4.28.0 \
-        --run-dir /tmp/imo26-imo2026_p1-TIMESTAMP \
-        --output solutions/imo2026_p1.md
+```sh
+RUN_DIR="/tmp/imo26-imo2026_p1-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$RUN_DIR"
+python3 code/orchestrator.py \
+  --problem problems/imo2026_p1.txt \
+  --run-dir "$RUN_DIR" \
+  --output solutions/imo2026_p1.md \
+  --self-improve recovery \
+  --validation-mode sandboxed \
+  --lean-mode required \
+  --axle-mode fallback \
+  --axle-environment lean-4.28.0 \
+  >"$RUN_DIR/stdout.log" 2>"$RUN_DIR/stderr.log"
+```
 
-Set run_in_background: true in the Bash tool call. Do NOT use nohup, &, or
-screen - run_in_background: true provides proper task tracking and process
-management. Save the backgroundTaskId, the PID, and the run directory path.
+Save the background task ID, PID, and run directory. The P1-P6 Claude prompts
+require AXLE fallback; if the client or key is missing, surface the preflight
+failure rather than weakening the policy.
 
-### Optional hosted AXLE verification
+## Monitor
 
-Local Lean is the default and AXLE is disabled unless a mode is explicitly
-selected. Install the optional client from `requirements-axle.txt`, inject
-`AXLE_API_KEY` into the orchestrator process environment without printing or
-persisting it, and select one of:
+After 30 seconds:
 
-    --axle-mode off
-    --axle-mode fallback
-    --axle-mode required
+```sh
+ps -p <pid>
+tail -20 <run-dir>/progress.log
+tail -20 <run-dir>/stderr.log
+cat <run-dir>/state.json
+```
 
-`off` never contacts AXLE. `fallback` calls AXLE only after local Lean fails,
-and either backend may satisfy the formal gate. `required` calls AXLE for every
-formalization and requires both backends to pass. Use
-`--axle-environment <name>` to override the default hosted environment
-(`lean-4.28.0`). Never put the AXLE key in a command line or run artifact.
+If the PID is absent, report the crash and diagnose it. Do not attach to
+another task's run. If progress contains `ERROR`, diagnose immediately rather
+than waiting.
 
-The supplied `prompts/claude_p*.txt` files select `fallback`. Make
-`AXLE_API_KEY` available to the background process through secure environment
-injection before launch. The orchestrator fails preflight before starting the
-run if the key or AXLE client is unavailable; it does not silently downgrade
-to `off`.
+Check no more than once every ten minutes and report only completed stages,
+errors, or terminal state. On every completed audit, inspect:
 
-To get the PID after launch, run:
-    ps aux | grep '[o]rchestrator.py.*<problem-id>'
+```text
+run_XX/candidate_NN.md
+run_XX/verify_YY.md
+run_XX/verify_YY.json
+run_XX/classify_YY.md
+run_XX/candidate_NN_statement_frozen.lean
+run_XX/lean_verify_NN_attempt_AA.txt
+```
 
-## First check after launch
+Summarize the mathematical finding, profile, exact verdict, candidate hash,
+formal-statement fidelity, and local/AXLE status.
 
-CRITICAL: Wait 30 seconds after launch, then check these files:
+The stream is durable: reasoning and visible output are flushed every few
+seconds. A 90-minute wall-clock timeout saves those partials and makes one
+smaller continuation attempt. `usage.jsonl` accounts for every model attempt,
+including retries and timeouts. A UI or Bash polling timeout does not mean the
+model stream failed.
 
-    cat <run-dir>/progress.log
-    tail <run-dir>/stderr.log
+## Built-in controls
 
-If progress.log shows any ERROR line, the orchestrator is failing. Common
-causes:
-  - Connection timeout to the API endpoint: wrong URL or endpoint is down
-  - 401 Unauthorized: wrong token for the chosen endpoint
-  - 422 Unprocessable Entity: model name not recognized
+- atomic output lock with owner PID;
+- bounded transport retries and exponential infrastructure backoff without
+  consuming a new outer-run number;
+- terminal handling for invalid credentials and endpoint contracts;
+- policy and OS sandbox for generated Python and local Lean;
+- exact machine-verdict parsing;
+- exact candidate- and frozen-statement-hash binding for all pass artifacts;
+- three distinct audits instead of repeated identical grading;
+- a fresh-solve pivot after three critical failures.
 
-Do NOT keep waiting if you see errors. Diagnose and fix the issue, then
-relaunch. Do NOT poll for sentinel files - the orchestrator never creates
-them.
-
-## Monitoring
-
-Monitor using the Bash tool to check progress files. Claude Code will notify
-you when the background task completes.
-
-### Monitoring loop
-
-Repeat this cycle until the orchestrator completes:
-
-1. Use a Bash command to check progress:
-       tail -5 <run-dir>/progress.log
-       cat <run-dir>/state.json
-
-2. Check process liveness:
-       ps -p <pid>
-
-3. Report significant events only (passes, errors, acceptance, failure).
-   Do NOT report every polling cycle.
-
-### Process liveness check
-
-CRITICAL: Before reading progress.log, check if the orchestrator process is
-still alive. The background process may have been killed or crashed without
-updating state.json.
-
-    ps -p <pid>   # PID from the launch step
-
-If the PID is gone, the orchestrator died. RESTART it immediately with the
-same arguments. Do NOT monitor or piggyback on another session's run - each
-session must own and manage its own orchestrator independently. "Do not
-silently duplicate active requests" refers to YOUR session's own active
-request only; another session running the same problem does not count as
-duplication.
-
-### State.json lag warning
-
-state.json is saved at the TOP of each loop iteration, BEFORE the reset
-logic runs. This means consecutive_passes and error_count may show stale
-values from the previous iteration. The actual in-memory values are correct
-but not yet written to disk. Do not be alarmed if state.json shows
-consecutive_passes=3 right after a FAIL - the reset to 0 has already
-happened in memory and will be reflected in the next state.json save.
-
-### Built-in protections
-
-The orchestrator has built-in protections that work without agent
-intervention:
-
-1. Wall-clock timeout: threading.Timer fires after 5400 seconds (90 minutes)
-   per API call, regardless of server keepalive. If the server sends
-   partial data that prevents the HTTP read timeout from firing, the
-   timer still triggers, aborting the call without retry. The failed run is then treated as a regular failure, triggering the pivot mechanism if needed.
-
-2. Infrastructure error detection: connection errors (endpoint down,
-   DNS failure) are detected separately from model errors. The
-   orchestrator waits with exponential backoff (30s, 60s, 120s) before
-   retrying, instead of burning through outer runs. After 5 consecutive
-   infrastructure errors, it terminates with ENDPOINT_UNAVAILABLE status.
-
-3. Duplicate run prevention: a lock file (<output>.lock) prevents two
-   orchestrators from running for the same problem simultaneously.
-
-4. Three-tier classifier: the classifier outputs "yes" (clean pass),
-   "improve" (minor gaps, conclusion valid - triggers non-destructive
-   refinement without resetting pass count), or "no" (critical error -
-   triggers destructive correction).
-
-5. Tolerance: first "no" after passes triggers a re-verify before
-   destructive correction, handling stochastic false negatives.
-
-6. Pivot mechanism: after 3 consecutive verification failures
-   (MAX_ERRORS=3), the current run fails and a new outer run starts
-   with a fresh SOLVE. The solver prompt includes a PIVOT_HINT on
-   outer_run > 1, telling the model to try a fundamentally different
-   approach. This prevents wasting time on wrong approaches.
-
-### Monitoring discipline
-
-- Check state no more than once every 10 minutes of wall clock.
-- Only report when an iteration completes, an error occurs, or the run
-  finishes.
-- Always check progress.log and stderr.log. Do NOT look for sentinel files.
-- Use tail -5 <run-dir>/progress.log and cat <run-dir>/state.json for
-  quick checks.
-- The progress.log file has one line per state transition; tail it to see
-  what happened since the last check.
-- Do NOT write complex monitor scripts with heredocs or embedded Python.
-
-## Resume after goal stop
-
-If the goal was stopped and later resumed:
-
-1. Check if the orchestrator process is still alive:
-       ps aux | grep '[o]rchestrator.py.*<problem-id>'
-
-2. If alive: resume monitoring. Find its run directory from the ps
-   output and check progress.log/state.json.
-
-3. If not alive: start a new run with a new run directory. The old
-   run's artifacts are preserved for reference.
-
-Note: Backgrounded processes survive goal stops by design. This is
-desired - the orchestrator should keep running even if the Claude Code
-session is interrupted. The process is NOT automatically killed when
-the goal is stopped.
+Do not disable, bypass, or lower these controls during a run.
 
 ## Cleanup
 
-When the orchestrator finishes (progress.log shows ACCEPTED or FAILED),
-kill the background process:
+Background processes can survive a stopped Claude task. List owned candidates:
 
-    kill <pid>
+```sh
+bash scripts/cleanup.sh
+```
 
-If the goal was stopped mid-flight, stale processes can be identified with:
+Terminate only a PID or exact run directory confirmed to belong to the stopped
+task:
 
-    bash scripts/cleanup.sh
+```sh
+bash scripts/cleanup.sh <pid>
+bash scripts/cleanup.sh <exact-run-dir>
+```
 
-Kill specific stale ones by PID or run directory:
-
-    bash scripts/cleanup.sh <pid>
-    bash scripts/cleanup.sh <run-dir>
-
-Do NOT kill processes that belong to other sessions.
-
-## Context and budget management
-
-CRITICAL - 4-call budget: Claude Code may abort the turn after 4 consecutive
-responses that do not include a tool call. Every response MUST include at
-least one tool call (e.g., a Bash command). Do not spend multiple responses
-on extended thinking alone. Break work into small phases: read files, create
-the run directory, launch the orchestrator, start a monitoring loop, check
-results - and act on each one immediately.
-
-CRITICAL - output token limit: If you encounter "Claude's response exceeded
-the 64000 output token maximum", set CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536 in
-the Claude Code environment. But the preferred fix is to keep responses short:
-launch the background process, then use concise monitoring loops rather than
-generating long inline analysis.
-
-## About the 600000ms timeout
-
-The Anthropic SDK's default timeout is 600000ms (10 minutes) for non-streaming
-API requests. This does NOT affect the orchestrator, which makes its own API
-calls directly to the model endpoint with a 5400-second timeout. Claude Code
-uses streaming with API_TIMEOUT_MS=3000000 (50 minutes), so its own API calls
-are not affected either. The 600000ms timeout is NOT a blocker for this
-workflow.
+The cleanup helper validates that the PID is an IMO26 orchestrator and avoids
+broad regex process killing. Never terminate another task's run.
 
 ## Completion
 
-On five consecutive passes, the orchestrator copies the accepted candidate to
-the output path and writes a final manifest with its SHA-256 hash. The agent
-may then report completion with the run directory, output path, and token
-summary.
-
-If all outer runs fail, report that no verified solution was found. Never
-promote a partial result or lower the acceptance threshold.
+On acceptance the orchestrator writes the solution and `manifest.json`, with
+the candidate hash, frozen and elaborated statement hashes, three audit
+artifacts, model settings, and global token total. If all outer runs fail,
+report that no verified solution was found. Never promote a partial artifact
+or relax the acceptance threshold.

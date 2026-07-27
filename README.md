@@ -1,91 +1,140 @@
 # IMO 2026 Direct Solver Harness
 
-A harness for solving IMO 2026 problems with a durable background workflow that
-uses long-request model calls (solve, self-improve, formalize, verify, classify,
-correct) with local Lean verification and 5 consecutive independent passes as
-the acceptance threshold.
-
-## Quick start
-
-1. Clone this repo.
-2. Put problem files in problems/ (already included for P1 through P6).
-3. Run `bash scripts/setup_lean.sh` once. This installs Lean through `elan` and
-   downloads the pinned Mathlib cache for fully local proof checking.
-4. Point your coding agent (Claude Code or Codex Desktop) at the repo and give
-   it one of the goal prompts from prompts/.
-
-The agent reads the workflow contract for its harness
-(workflows/claude.md or workflows/codex.md), writes an orchestrator script
-using the prompts from code/prompts.py, launches it as a detached background
-process, and monitors until completion.
-
-## Repo layout
-
-problems/             IMO 2026 problem statements (P1-P6)
-code/prompts.py       Authoritative role prompts (solver, verifier, etc.)
-code/orchestrator.py  Background orchestrator template (OpenAI-compatible API)
-lean/                 Pinned local Lean 4 + Mathlib Lake project
-scripts/setup_lean.sh One-time local Lean/Mathlib setup
-workflows/            Harness-specific workflow contracts
-  claude.md           Claude Code: Bash long-polling, max_tokens recovery
-  codex.md            Codex Desktop: screen-based monitoring, no busy-waiting
-prompts/              Goal prompts to paste into each harness
-
-## How it works
-
-The workflow runs entirely in a background Python script. The desktop agent
-launches it and monitors progress; it never holds the long model calls itself.
-
-Each iteration:
-1. SOLVE - one long-request call with the problem and solver prompt
-2. SELF-IMPROVE - a second call with the solver output for refinement
-3. LEAN_FORMALIZE - translate the candidate into a faithful `imo_problem`
-4. LEAN_VERIFY - compile locally with Mathlib; repair the formalization once
-5. VERIFY - grade the informal proof and audit formal-statement fidelity
-6. CLASSIFY - return yes/improve/no on the combined report
-7. CORRECT - if classified no, use the report to fix the proof
-
-Five consecutive yes classifications on an unchanged candidate accepts it,
-and the default `--lean-mode required --axle-mode off` additionally requires a
-local Lean pass.
-Generated `.lean` sources and compiler reports are saved in each run directory.
-Three correction failures or 30 iterations fails the outer run.
-Up to 10 fresh outer runs are attempted.
+A durable background workflow for producing and auditing IMO solutions with
+model-generated proofs, three distinct verifier profiles, sandboxed
+computational evidence, and optional Lean/AXLE formal verification.
 
 ## Requirements
 
-Python 3.10+ with the requests library, plus the local Lean environment created
-by `bash scripts/setup_lean.sh`. Runtime proof checking is local and requires no
-account or hosted proof service. The orchestrator reads model API credentials
-from the environment or command line; never from the repo.
+- Python 3.10 or newer with `requests`
+- macOS `sandbox-exec` for generated Python and local Lean execution
+- Lean 4 and pinned Mathlib, installed by `bash scripts/setup_lean.sh`
+- Optional AXLE client from `requirements-axle.txt` (Python 3.11+)
 
-Formal verification modes:
+The default workflow never executes model-generated Python or Lean directly on
+the host. If `sandbox-exec` is unavailable, use `--validation-mode off` and
+`--lean-mode off`; the orchestrator refuses an unsandboxed fallback.
 
-- `--lean-mode required` (default): a candidate cannot be accepted without a
-  formal pass. With AXLE off, this means a local Lean pass.
-- `--lean-mode best-effort`: always attempt Lean and feed its report to the
-  verifier, but do not make compilation an acceptance gate.
-- `--lean-mode off`: explicitly disable Lean.
+## Setup
 
-Hosted AXLE verification is optional and off by default. Enabling it sends the
-generated Lean source to Axiom's service. The optional client requires
-Python 3.11 or newer:
+```sh
+python3 -m pip install -r requirements.txt
+bash scripts/setup_lean.sh
+
+export IMO_SOLVER_API_URL="https://model-host/v1/chat/completions"
+export IMO_SOLVER_TOKEN="..."
+export IMO_SOLVER_MODEL="..."
+```
+
+The model token is read only from `IMO_SOLVER_TOKEN` or a mode-0600
+`--api-key-file`. It must never be committed or placed on a command line.
+
+AXLE is optional:
 
 ```sh
 python3 -m pip install -r requirements-axle.txt
-export AXLE_API_KEY="<your AXLE key>"
-python3 code/orchestrator.py ... --axle-mode fallback
+export AXLE_API_KEY="..."
 ```
 
-- `--axle-mode off` (default): never contact AXLE.
-- `--axle-mode fallback`: contact AXLE only when local Lean fails; either
-  backend may satisfy the formal gate.
-- `--axle-mode required`: contact AXLE for every formalization and require both
-  local Lean and AXLE to pass.
-- `--axle-environment lean-4.28.0`: select the hosted Lean environment.
+## Repository layout
 
-The AXLE key is accepted only through `AXLE_API_KEY`; there is deliberately no
-key command-line flag, and the key is never written to run artifacts.
+```text
+code/         orchestrator and authoritative model prompts
+lean/         pinned Lean 4 and Mathlib project
+problems/     P1-P6 problem statements
+prompts/      Codex/Claude launch prompts and templates
+scripts/      Lean setup and safe process cleanup
+tests/        workflow, sandbox, Lean, and AXLE regressions
+workflows/    harness-specific launch and monitoring contracts
+```
+
+## Flow
+
+1. `EMPIRICAL_PROBE` optionally generates a small-case script. The script is
+   policy-checked, sandboxed, output-bounded, and preserved with stdout/stderr.
+   Its output is explicitly labeled untrusted evidence.
+2. `SOLVE` produces the first informal candidate.
+3. `SELF_IMPROVE` runs only when SOLVE is incomplete by default. Configure
+   `--self-improve recovery|always|off`; `always` forces one independent review
+   even when SOLVE is already complete.
+4. `proof_logic` audits the complete informal argument before formal work.
+5. `LEAN_STATEMENT` drafts only the `imo_problem ... := by` prefix.
+   `statement_fidelity` compares that exact prefix with the natural-language
+   problem. A rejection redrafts the statement without mutating the informal
+   proof; a pass freezes the exact bytes and their SHA-256.
+6. `LEAN_FORMALIZE` may add only the proof body after the frozen prefix.
+   Repairs that alter the prefix are rejected before execution. Local Lean
+   verifies the theorem, records the elaborated statement hash and axioms, and
+   runs in an OS sandbox.
+7. `--axle-mode fallback` may check the same frozen-statement source through
+   hosted AXLE when local Lean fails; `required` requires both backends.
+8. `computation` audits algebraic/computational evidence and final consistency
+   among the informal proof, frozen statement, and formal report.
+9. A verdict of `improve` or `no` on the mathematical audits clears every pass
+   before candidate mutation. Acceptance requires all three audit artifacts
+   to carry one candidate SHA-256 and one frozen-statement SHA-256, plus the
+   configured formal gate.
+
+`CAS_VERIFY` and `CAS_COMPUTE` produce preserved evidence only. Computational
+output is sent to the verifier/corrector and is never appended to the solution
+as a substitute for proof.
+
+## Run
+
+```sh
+python3 code/orchestrator.py \
+  --problem problems/imo2026_p1.txt \
+  --run-dir /tmp/imo26-p1-$(date -u +%Y%m%dT%H%M%SZ) \
+  --output solutions/imo2026_p1.md \
+  --lean-mode required \
+  --axle-mode off \
+  --self-improve recovery \
+  --validation-mode sandboxed
+```
+
+Model configuration comes from the environment. `IMO_VERIFIER_MODEL` may name
+a distinct verifier model; otherwise the solver model is reused with three
+different audit profiles.
+
+## Artifacts
+
+Each run records:
+
+- candidates, verifier reports, derived verdicts, and candidate hashes;
+- generated empirical/CAS scripts with stdout, stderr, and execution metadata;
+- live reasoning and visible partial-output files flushed during streaming;
+- proposed and frozen Lean statements, proof sources, local/AXLE reports,
+  candidate hash, frozen-statement hash, and elaborated-statement hash;
+- `usage.jsonl` with every model attempt, including retries and timeouts;
+- `state.json`, `failure_ledger.json`, and the accepted `manifest.json`.
+
+The example uses `/tmp` for disposable experiments. For retained audit trails,
+point `--run-dir` at a persistent, access-controlled location; reasoning traces
+can be large and may contain sensitive problem-solving context.
+
+## Verification modes
+
+- `--lean-mode required` (default): acceptance requires the formal gate.
+- `--lean-mode best-effort`: formal reports inform the verifier but do not gate
+  acceptance.
+- `--lean-mode off`: no Lean source is generated or executed.
+- `--axle-mode off` (default): never contact AXLE.
+- `--axle-mode fallback`: use AXLE only after local Lean fails.
+- `--axle-mode required`: require both local Lean and AXLE.
+
+AXLE sends generated Lean source to Axiom's hosted service. The AXLE key is
+accepted only through `AXLE_API_KEY`.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The tests cover candidate and frozen-statement hash invariants, isolated
+statement redrafting, prefix-preserving proof repair, streak resets,
+fail-closed CAS handling, sandbox policy, atomic locks, Lean declaration
+validation, local Lean compilation, and AXLE semantics.
 
 ## License
 

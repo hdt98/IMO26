@@ -44,7 +44,17 @@ Before finalizing your output, carefully review your "Method Sketch" and "Detail
 """
 
 self_improvement_prompt = """
-You have an opportunity to improve your solution. Please review your solution carefully. Correct errors and fill justification gaps if any. Your second round of output should strictly follow the instructions in the system prompt.
+The previous SOLVE response was empty, truncated, malformed, or explicitly
+partial. Recover a complete solution from the full context below. Preserve any
+rigorous progress, correct errors, and fill justification gaps. Your output
+must strictly follow the system prompt.
+"""
+
+self_review_prompt = """
+Independently audit the complete solution you just wrote. Preserve its approach
+when sound, but correct any logical error and close every justification gap.
+Return the complete revised solution in the exact format required by the system
+prompt. Do not discuss the review process.
 """
 
 correction_prompt = """
@@ -101,6 +111,13 @@ Your response MUST be structured into two main sections: a **Summary** followed 
 *   **b. Detailed Verification Log**
     Following the summary, provide the full, step-by-step verification log as defined in the Core Instructions. When you refer to a specific part of the solution, **quote the relevant text** to make your reference clear before providing your detailed analysis of that part.
 
+*   **c. Machine Verdict**
+    The final non-empty line MUST be exactly one of:
+    `VERDICT: yes`, `VERDICT: improve`, or `VERDICT: no`.
+    Use `yes` only for a fully correct solution, `improve` only for minor
+    justification or presentation gaps that preserve the argument, and `no`
+    for a critical error or major gap.
+
 **Example of the Required Summary Format**
 *This is a generic example to illustrate the required format. Your findings must be based on the actual solution provided below.*
 
@@ -118,9 +135,8 @@ verification_reminder = """
 ### Verification Task Reminder ###
 
 Your task is to act as an IMO grader. Now, generate the **summary** and the **step-by-step verification log** for the solution above. In your log, justify each correct step and explain in detail any errors or justification gaps you find, as specified in the instructions above.
+End with the required machine-verdict line.
 """
-
-classifier_prompt = 'Response in "yes", "improve", or "no". Is the following verification saying the solution is correct ("yes"), has only minor justification gaps that do not invalidate the conclusion ("improve"), or has a critical error or major justification gap that invalidates the solution ("no")?'
 
 refinement_prompt = """
 Below is the full verification report (including both the summary and the detailed step-by-step verification log). The solution is fundamentally correct but has minor justification gaps. Please close these gaps while keeping the same approach and structure. Do not change the main argument or introduce new techniques. Make targeted fixes only. Your refined solution should strictly follow the instructions in the system prompt.
@@ -150,7 +166,9 @@ Below is a mathematical solution. Extract every algebraic identity, polynomial d
 - Import sympy and define all relevant symbolic variables
 - For each identity: compute both sides, simplify, and check equality
 - For polynomial divisibility: compute remainder and check if zero
-- Print "PASS: <brief description>" or "FAIL: <brief description>" for each
+- Print exactly one "PASS: <exact claim>" or "FAIL: <exact claim>" line for
+  every extracted claim
+- Never print unlabelled diagnostic output
 
 If there are no algebraic identities to verify, print "NO_ALGEBRAIC_CLAIMS".
 
@@ -169,38 +187,67 @@ Your task: Write SymPy code that directly verifies the incomplete identity or co
 - Compute both sides of the identity (or the expression that should be zero)
 - Apply any constraints from the solution to eliminate variables
 - Simplify and check if the result is zero
-- Print "IDENTITY_CONFIRMED" if the identity holds, or "IDENTITY_DENIED: <reason>" if it does not
+- Print `IDENTITY: <exact identity>`, `ASSUMPTIONS: <exact assumptions>`, and
+  either `RESULT: CONFIRMED` or `RESULT: DENIED: <reason>`
 
 Keep the code under 150 lines. Output only the Python code, no explanations or markdown fences.
 
 ### Solution ###
 """
 
-lean_formalize_prompt = """
-Formalize and prove the supplied olympiad problem in Lean 4 using Mathlib.
+lean_statement_prompt = """
+Translate the supplied olympiad problem into one faithful Lean 4 theorem
+statement. Do not prove it yet.
 
 Requirements:
-- Output only a self-contained Lean source file, without markdown fences
+- Output only a Lean source prefix, without markdown fences or comments
 - Begin with `import Mathlib`
-- State the full problem faithfully as one theorem named `imo_problem`
-- Prove `imo_problem`; do not weaken, replace, or assume its conclusion
-- You may add proved helper lemmas
+- Then write `set_option autoImplicit false`
+- State the full problem faithfully as exactly one theorem named `imo_problem`
+- End at the theorem proof introducer `:= by`; output nothing after `by`
+- Do not add helper declarations
+- Make every binder, domain restriction, hypothesis, quantifier, and conclusion
+  explicit enough to compare directly with the natural-language problem
 - Do not use `sorry`, `admit`, `axiom`, `opaque`, `unsafe`, or any undeclared hypothesis
-- Keep the formal statement readable enough to compare against the natural-language problem
-- The supplied informal solution is guidance, not an authority; correct formal errors you notice
+- Do not define syntax, macros, elaborators, initializers, foreign functions,
+  read files at compile time, or execute commands/tactics such as `run_cmd`,
+  `run_tac`, `native_decide`, `#eval`, or `#run`
 
 ### Problem ###
 """
 
+lean_formalize_prompt = """
+Prove the already reviewed and frozen Lean theorem statement below using Lean 4
+and Mathlib.
+
+Requirements:
+- Output only one complete Lean source file, without markdown fences
+- Copy the entire frozen prefix byte-for-byte as the beginning of your output
+- Add only the proof body after the final `by`
+- Do not change imports, options, binders, hypotheses, theorem name, or conclusion
+- You may use local `have` statements inside the proof, but add no declarations
+  before the frozen theorem
+- Do not use `sorry`, `admit`, `axiom`, `opaque`, `unsafe`, or undeclared hypotheses
+- Do not define syntax, macros, elaborators, initializers, foreign functions,
+  read files at compile time, or execute commands/tactics such as `run_cmd`,
+  `run_tac`, `native_decide`, `#eval`, or `#run`
+
+### Frozen Lean Statement Prefix ###
+"""
+
 lean_repair_prompt = """
 Repair the supplied Lean 4 formalization so that it passes the configured formal
-verification checks and remains a faithful formalization of the entire problem.
+verification checks without changing the reviewed theorem statement.
 
 Requirements:
 - Output only the complete repaired Lean source file, without markdown fences
-- Preserve the theorem name `imo_problem`
-- Do not weaken or replace the theorem statement to make the proof easier
+- Copy the supplied frozen prefix byte-for-byte as the beginning of your output
+- Change only the proof body after the frozen prefix's final `by`
+- Do not alter imports, options, binders, hypotheses, theorem name, or conclusion
 - Do not use `sorry`, `admit`, `axiom`, `opaque`, `unsafe`, or undeclared hypotheses
+- Do not define syntax, macros, elaborators, initializers, foreign functions,
+  read files at compile time, or execute commands/tactics such as `run_cmd`,
+  `run_tac`, `native_decide`, `#eval`, or `#run`
 - Address every compiler or policy error in the report
 
 ### Problem ###

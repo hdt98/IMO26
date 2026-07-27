@@ -2,33 +2,32 @@
 """
 IMO 2026 direct solver orchestrator.
 
-Harness-agnostic background script implementing the
-solve -> self-improve -> verify -> classify -> correct loop
-using OpenAI-compatible chat completions.
+Harness-agnostic background script implementing a solve, evidence, audit,
+formalization, and correction loop using OpenAI-compatible chat completions.
 
 Usage:
     python3 orchestrator.py \
         --problem problems/imo2026_p1.txt \
-        --api-url http://host:port/v1/chat/completions \
-        --api-key TOKEN \
-        --model MODEL_NAME \
         --run-dir /tmp/imo26-run \
         --output solutions/imo2026_p1.md
 
 Environment fallbacks: IMO_SOLVER_API_URL, IMO_SOLVER_TOKEN, IMO_SOLVER_MODEL,
-IMO_LEAN_MODE, IMO_AXLE_MODE, AXLE_API_KEY, AXLE_ENVIRONMENT
+IMO_VERIFIER_MODEL, IMO_SELF_IMPROVE, IMO_VALIDATION_MODE, IMO_LEAN_MODE,
+IMO_AXLE_MODE, AXLE_API_KEY, AXLE_ENVIRONMENT
 
 """
 
 import argparse
+import ast
+import atexit
 import hashlib
 import json
 import os
-import signal
 import shutil
 import sys
 import subprocess
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -42,49 +41,71 @@ sys.path.insert(0, str(Path(__file__).parent))
 from prompts import (
     step1_prompt,
     self_improvement_prompt,
+    self_review_prompt,
     correction_prompt,
     empirical_probe_prompt,
     cas_verify_prompt,
     cas_compute_prompt,
+    lean_statement_prompt,
     lean_formalize_prompt,
     lean_repair_prompt,
     verification_system_prompt,
     verification_reminder,
-    classifier_prompt,
     refinement_prompt,
 )
 
 # -- Constants --
 
 MAX_ITERATIONS = 30
-MAX_ERRORS = 3  # consecutive failures before run restarts (was 10)
-# Lowered to 3: if the model cannot fix its approach in 3 corrections,
-# it is likely on a fundamentally wrong track. A fresh SOLVE with a
-# pivot hint gives a better chance than more corrections.
-REQUIRED_PASSES = 5
+MAX_ERRORS = 3
 MAX_OUTER_RUNS = 10
 MAX_TOKENS = 256_000
-CORRECT_MAX_TOKENS = 128_000  # Gap 1+5: cap CORRECT/REFINE to prevent oversized outputs
+CORRECT_MAX_TOKENS = 128_000
 THINKING_BUDGET = 200_000
-CORRECT_THINKING_BUDGET = 100_000  # Gap 5: smaller thinking budget for corrections
+CORRECT_THINKING_BUDGET = 100_000
 HTTP_TIMEOUT = 5400
 MAX_TRANSPORT_RETRIES = 3
 MAX_INFRA_RETRIES = 5  # consecutive infra errors before giving up
 INFRA_BACKOFF_BASE = 30  # seconds, doubled each consecutive infra error
 VALIDATION_TIMEOUT = 60  # seconds for executing empirical/CAS validation scripts
+VALIDATION_OUTPUT_LIMIT = 100_000
 VALIDATION_MAX_TOKENS = 65536  # token budget for validation code generation
 VALIDATION_THINKING_BUDGET = 4096  # thinking budget for validation code generation
-CAS_MAX_RETRIES = 1  # max CORRECT retry when CAS verification fails
 LEAN_TIMEOUT = 300
 LEAN_MAX_REPAIRS = 1
 LEAN_MAX_TOKENS = 128_000
 LEAN_THINKING_BUDGET = 64_000
+FORMAL_MAX_ATTEMPTS = 2
+LIVE_TRACE_INTERVAL = 5
 
-# Wall-clock timeout per API call. Uses threading.Timer (not signal.alarm)
-# because signal.alarm delivery is delayed by 500+ seconds on macOS when the
-# main thread is blocked in a C extension (SSL recv) during streaming.
-# threading.Timer fires in a separate thread and checks timer.fired in the
-# SSE parsing loop, providing reliable timeout regardless of main thread state.
+VERIFICATION_PROFILES = (
+    (
+        "proof_logic",
+        "Audit the complete informal proof: its logical chain, dependencies, "
+        "case coverage, definitions, boundary cases, and circularity. Check "
+        "that every decisive lemma is proved and the claimed conclusion follows.",
+    ),
+    (
+        "statement_fidelity",
+        "Audit quantifiers, domains, hypotheses, and the exact conclusion. "
+        "When a proposed Lean statement is supplied, compare it directly with "
+        "the natural-language problem and actively seek weakened, strengthened, "
+        "or missing cases. Judge statement fidelity only; the proof is audited "
+        "separately.",
+    ),
+    (
+        "computation",
+        "Audit every algebraic, combinatorial, and numerical transformation. "
+        "Check the assumptions and coverage of supplied computational evidence, "
+        "then perform a final consistency check between the informal proof and "
+        "the verified frozen formal statement.",
+    ),
+)
+REQUIRED_PASSES = len(VERIFICATION_PROFILES)
+
+# Wall-clock timeout per API call. A timer thread closes an active response so
+# a blocked streaming read is interrupted, then the caller gets both partial
+# reasoning and partial visible content.
 WALL_CLOCK_TIMEOUT = 5400  # max wall-clock per API call (90 min)
 
 
@@ -102,20 +123,59 @@ class InfrastructureError(Exception):
     can wait with backoff instead of burning through outer runs."""
 
 
+class ConfigurationError(Exception):
+    """Raised for credentials, endpoint, or response-contract failures that
+    retries cannot repair."""
+
+
+class UsageLedger:
+    """Record every model attempt and expose aggregate usage."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.events = []
+
+    def record(self, label, usage=None, finish="unknown", status="completed"):
+        usage = usage or {}
+        event = {
+            "timestamp": now_utc(),
+            "label": label,
+            "status": status,
+            "finish_reason": finish,
+            "usage": usage,
+        }
+        self.events.append(event)
+        if self.path:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    @property
+    def total_tokens(self):
+        return sum(
+            int(event["usage"].get("total_tokens", 0) or 0)
+            for event in self.events
+        )
+
+
 class _WallClockTimer:
-    """Thread-based wall-clock timer. More reliable than signal.alarm on macOS
-    during streaming I/O, where signal delivery can be delayed by 500+ seconds
-    because the main thread is blocked in a C extension (SSL recv)."""
+    """Interrupt an active streaming response when the deadline expires."""
+
     def __init__(self, timeout, log_fn=None):
         self._timer = None
         self._fired = False
         self._timeout = timeout
         self._log_fn = log_fn
+        self._abort_fn = None
 
     def _fire(self):
         self._fired = True
         if self._log_fn:
             self._log_fn(f"wall-clock timer fired after {self._timeout}s")
+        if self._abort_fn:
+            try:
+                self._abort_fn()
+            except Exception:
+                pass
 
     def start(self):
         self._fired = False
@@ -123,10 +183,16 @@ class _WallClockTimer:
         self._timer.daemon = True
         self._timer.start()
 
+    def set_abort(self, abort_fn):
+        self._abort_fn = abort_fn
+        if self._fired:
+            abort_fn()
+
     def cancel(self):
         if self._timer:
             self._timer.cancel()
             self._timer = None
+        self._abort_fn = None
 
     @property
     def fired(self):
@@ -175,28 +241,117 @@ def save_text(directory, filename, content):
     return path
 
 
+def save_atomic_text(path, content):
+    """Replace a durable text artifact without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def is_standalone_yes(text):
-    """Accept only an unambiguous standalone 'yes' (case-insensitive, ignoring
-    surrounding whitespace, quotes, and trailing punctuation). Empty, mixed, or
-    qualified responses count as no."""
+def parse_verdict(text):
+    """Parse the verifier's required final machine-verdict line."""
     if not text:
-        return False
-    t = text.strip().strip('"').strip("'").strip()
-    t = t.rstrip(".!?。").strip()
-    return t.lower() == "yes"
+        return "no"
+    lines = [line.strip().lower() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "no"
+    match = re.fullmatch(r"verdict:\s*(yes|improve|no)", lines[-1])
+    return match.group(1) if match else "no"
 
-def is_standalone_improve(text):
-    """Accept only an unambiguous standalone 'improve' (same normalization as
-    is_standalone_yes)."""
-    if not text:
+
+def candidate_is_complete(candidate):
+    """Recognize the required solver output shape before formal verification."""
+    if not candidate or not candidate.strip():
         return False
-    t = text.strip().strip('"').strip("'").strip()
-    t = t.rstrip(".!?。").strip()
-    return t.lower() == "improve"
+    lowered = candidate.lower()
+    summary = lowered.split("detailed solution", 1)[0]
+    incomplete_markers = (
+        "partial solution",
+        "incomplete solution",
+        "not found a complete solution",
+        "not have a complete solution",
+        "unable to complete",
+        "could not complete",
+    )
+    return (
+        "summary" in lowered
+        and "detailed solution" in lowered
+        and not any(marker in summary for marker in incomplete_markers)
+    )
+
+
+def acquire_output_lock(output_path):
+    """Atomically claim the output lock, replacing only a stale lock."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output_path.with_suffix(output_path.suffix + ".lock")
+    for _ in range(2):
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            try:
+                raw_pid = lock_path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot read existing output lock {lock_path}: {exc}"
+                ) from exc
+            try:
+                old_pid = int(raw_pid)
+            except ValueError:
+                lock_path.unlink(missing_ok=True)
+                continue
+            try:
+                os.kill(old_pid, 0)
+            except ProcessLookupError:
+                lock_path.unlink(missing_ok=True)
+                continue
+            except PermissionError as exc:
+                raise RuntimeError(
+                    f"Cannot inspect lock owner PID {old_pid}: {exc}"
+                ) from exc
+            raise RuntimeError(
+                f"Another orchestrator (PID {old_pid}) is already running "
+                f"for {output_path}."
+            )
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            return lock_path
+    raise RuntimeError(f"Could not acquire output lock: {lock_path}")
+
+
+def release_output_lock(lock_path):
+    try:
+        owner = int(lock_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if owner == os.getpid():
+        lock_path.unlink(missing_ok=True)
+
+
+def _flush_stream_artifacts(reasoning_path, reasoning_parts, content_parts):
+    if reasoning_path is None:
+        return
+    reasoning_path.parent.mkdir(parents=True, exist_ok=True)
+    reasoning_path.write_text(
+        "".join(reasoning_parts),
+        encoding="utf-8",
+    )
+    reasoning_path.with_suffix(".partial.md").write_text(
+        "".join(content_parts),
+        encoding="utf-8",
+    )
 
 
 # -- API --
@@ -204,12 +359,8 @@ def is_standalone_improve(text):
 def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=None, thinking_budget=None, reasoning_path=None):
     """Return (content, usage, finish_reason) from an OpenAI-compatible call.
 
-    The GLM-5.2-FP8 endpoint supports Anthropic-style thinking via the
-    OpenAI-compatible API. When thinking is enabled, the model reasons first
-    (consuming reasoning_tokens against the budget) then emits visible content.
-    The response message includes a reasoning_content field separate from
-    content. Empirically validated by the P3 run: the solver used 124650
-    reasoning tokens out of the 200000 budget and completed normally.
+    The configured endpoint is expected to expose reasoning_content separately
+    from visible content in streaming deltas. Both channels are preserved.
     """
     headers = {
         "Content-Type": "application/json",
@@ -225,28 +376,35 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
     }
     last_error = None
     for attempt in range(1, MAX_TRANSPORT_RETRIES + 1):
+        content_parts = []
+        reasoning_parts = []
+        usage = {}
+        finish = "unknown"
         try:
             wc_timer = _WallClockTimer(WALL_CLOCK_TIMEOUT, log_fn=log_fn)
             wc_timer.start()
             try:
                 resp = requests.post(
-                    api_url, headers=headers, json=payload, timeout=HTTP_TIMEOUT,
+                    api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=(30, HTTP_TIMEOUT),
                     stream=True,
                 )
+                wc_timer.set_abort(resp.close)
+                if resp.status_code in (400, 401, 403, 404, 422):
+                    raise ConfigurationError(
+                        f"Model endpoint rejected the request "
+                        f"(HTTP {resp.status_code})."
+                    )
                 resp.raise_for_status()
 
-                # Parse SSE stream: accumulate content and capture usage +
-                # finish_reason from chunks. Streaming keeps the connection
-                # alive, preventing the server from closing it before the
-                # full response is generated.
-                content_parts = []
-                reasoning_parts = []
-                usage = {}
-                finish = "unknown"
+                last_trace_flush = time.monotonic()
                 for line in resp.iter_lines(decode_unicode=True):
                     if wc_timer.fired:
-                        if reasoning_path is not None and reasoning_parts:
-                            reasoning_path.write_text("".join(reasoning_parts))
+                        _flush_stream_artifacts(
+                            reasoning_path, reasoning_parts, content_parts
+                        )
                         raise _WallClockTimeout(
                             f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s "
                             "(server may be sending keepalive without real data)",
@@ -277,30 +435,70 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
                         reasoning_parts.append(delta["reasoning_content"])
                     if delta.get("content"):
                         content_parts.append(delta["content"])
+                    if (
+                        reasoning_path is not None
+                        and time.monotonic() - last_trace_flush
+                        >= LIVE_TRACE_INTERVAL
+                    ):
+                        _flush_stream_artifacts(
+                            reasoning_path, reasoning_parts, content_parts
+                        )
+                        last_trace_flush = time.monotonic()
                     fr = choices[0].get("finish_reason")
                     if fr:
                         finish = fr
+                if wc_timer.fired:
+                    _flush_stream_artifacts(
+                        reasoning_path, reasoning_parts, content_parts
+                    )
+                    raise _WallClockTimeout(
+                        f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s",
+                        partial_content="".join(content_parts),
+                        partial_reasoning="".join(reasoning_parts),
+                    )
                 content = "".join(content_parts)
             finally:
                 wc_timer.cancel()
-            if reasoning_path is not None and reasoning_parts:
-                reasoning_path.write_text("".join(reasoning_parts))
+            _flush_stream_artifacts(
+                reasoning_path, reasoning_parts, content_parts
+            )
             return content, usage, finish
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        except ConfigurationError:
+            raise
+        except requests.exceptions.RequestException as exc:
             last_error = exc
-            is_conn_error = isinstance(exc, requests.exceptions.ConnectionError)
+            _flush_stream_artifacts(
+                reasoning_path, reasoning_parts, content_parts
+            )
+            if wc_timer.fired:
+                raise _WallClockTimeout(
+                    f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s",
+                    partial_content="".join(content_parts),
+                    partial_reasoning="".join(reasoning_parts),
+                ) from exc
+            is_network_error = isinstance(
+                exc,
+                (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                ),
+            )
             if attempt < MAX_TRANSPORT_RETRIES:
-                backoff = INFRA_BACKOFF_BASE * (2 ** (attempt - 1)) if is_conn_error else 5 * attempt
+                backoff = (
+                    INFRA_BACKOFF_BASE * (2 ** (attempt - 1))
+                    if is_network_error
+                    else 5 * attempt
+                )
                 if log_fn:
                     log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, retrying in {backoff}s")
                 time.sleep(backoff)
             else:
                 if log_fn:
                     log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, no retries left")
-                if is_conn_error:
-                    raise InfrastructureError(
-                        f"Endpoint unreachable after {MAX_TRANSPORT_RETRIES} attempts: {last_error}"
-                    ) from last_error
+                raise InfrastructureError(
+                    "Model endpoint unavailable after "
+                    f"{MAX_TRANSPORT_RETRIES} attempts: {last_error}"
+                ) from last_error
         except _WallClockTimeout as exc:
             # Do NOT retry on wall-clock timeout. The call took too long
             # (server stall or oversized request). Retrying wastes another
@@ -310,6 +508,15 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
             raise
         except Exception as exc:
             last_error = exc
+            _flush_stream_artifacts(
+                reasoning_path, reasoning_parts, content_parts
+            )
+            if wc_timer.fired:
+                raise _WallClockTimeout(
+                    f"Wall-clock timeout after {WALL_CLOCK_TIMEOUT}s",
+                    partial_content="".join(content_parts),
+                    partial_reasoning="".join(reasoning_parts),
+                ) from exc
             if attempt < MAX_TRANSPORT_RETRIES:
                 if log_fn:
                     log_fn(f"attempt {attempt}/{MAX_TRANSPORT_RETRIES} failed: {exc}, retrying")
@@ -323,13 +530,11 @@ def chat_completion(api_url, api_key, model, messages, log_fn=None, max_tokens=N
 
 
 # -- Prompt builders --
-# Faithful to the proven message structures from the successful P3 and P6 runs.
-# Key design choices validated across all 6 accepted solutions:
+# Message structures retain the useful multi-turn correction pattern:
 # - Correction uses multi-turn (user/assistant/user) so the model sees its own
 #   previous solution as context and can fix specific issues.
 # - Verifier puts all instructions in the user message with a minimal system
-#   prompt, matching the P3 proven structure.
-# - Classifier uses strict standalone "yes" detection.
+#   prompt and emits its own strict machine-verdict line.
 
 DNL = "\n\n"
 DIV = "\n" + "=" * 70 + "\n"
@@ -338,7 +543,15 @@ DIV = "\n" + "=" * 70 + "\n"
 def build_solver_messages(problem, outer_run=1, pivot_hint=None, empirical_results=None, failure_context=None):
     user = problem.strip() + PRESENTATION_LIMIT_NOTE
     if empirical_results:
-        user += chr(10) + chr(10) + "### Computational Ground Truth ###" + chr(10) + chr(10) + empirical_results
+        user += (
+            DNL
+            + "### Untrusted Small-Case Evidence ###"
+            + DNL
+            + "Use this only for conjecture generation and sanity checks. "
+            + "It is not a proof and may contain implementation mistakes."
+            + DNL
+            + empirical_results
+        )
     if failure_context:
         user += chr(10) + chr(10) + failure_context
     if outer_run > 1:
@@ -350,12 +563,21 @@ def build_solver_messages(problem, outer_run=1, pivot_hint=None, empirical_resul
     ]
 
 
-def build_self_improvement_messages(problem, solution):
-    return [
-        {"role": "system", "content": step1_prompt.strip()},
-        {"role": "user", "content": problem.strip()},
+def build_self_improvement_messages(
+    solver_messages,
+    solution,
+    recovery=True,
+):
+    return list(solver_messages) + [
         {"role": "assistant", "content": solution},
-        {"role": "user", "content": self_improvement_prompt.strip()},
+        {
+            "role": "user",
+            "content": (
+                self_improvement_prompt
+                if recovery
+                else self_review_prompt
+            ).strip(),
+        },
     ]
 
 
@@ -368,7 +590,14 @@ def extract_section(text, marker, after=True):
     return text[:idx].strip()
 
 
-def build_verifier_messages(problem, solution, formal_report=None):
+def build_verifier_messages(
+    problem,
+    solution,
+    formal_report=None,
+    computational_report=None,
+    profile=None,
+    proposed_formal_statement=None,
+):
     detailed = extract_section(solution, "Detailed Solution")
     if not detailed:
         detailed = solution.strip()
@@ -386,6 +615,32 @@ def build_verifier_messages(problem, solution, formal_report=None):
             + "flag any weakened, altered, or incomplete formalization as a Critical Error."
             + DNL
         )
+    if proposed_formal_statement:
+        user += (
+            DIV + "### Proposed Lean Statement (Not Yet Proved) ###" + DNL
+            + proposed_formal_statement.strip() + DNL
+            + "Audit only whether this exact theorem statement faithfully "
+            + "encodes every quantifier, domain, hypothesis, and conclusion "
+            + "of the original problem. It will be frozen only if this audit "
+            + "passes."
+            + DNL
+        )
+    if computational_report:
+        user += (
+            DIV + "### Untrusted Computational Evidence ###" + DNL
+            + computational_report.strip() + DNL
+            + "Audit the code coverage, assumptions, and relevance. Treat it "
+            + "as supporting evidence only, never as a replacement for proof."
+            + DNL
+        )
+    if profile:
+        user += (
+            DIV + "### Assigned Audit Profile ###" + DNL
+            + profile.strip() + DNL
+            + "This is your exclusive audit scope. Do not fail the candidate "
+            + "for concerns assigned to another profile; report only findings "
+            + "within this scope." + DNL
+        )
     user += verification_reminder.strip()
     return [
         {"role": "system", "content": "You are an expert IMO grader. Follow the instructions exactly."},
@@ -393,19 +648,22 @@ def build_verifier_messages(problem, solution, formal_report=None):
     ]
 
 
-def build_classifier_messages(verification):
-    user = classifier_prompt.strip() + DNL + verification.strip()
-    return [{"role": "user", "content": user}]
-
-
-def build_correction_messages(problem, solution, verification, cas_feedback=None):
-    # Gap 7: Send the ENTIRE verification (Summary + Detailed Log) to the
-    # corrector, not just the Summary. The detailed log contains numerical
-    # counterexamples and step-by-step reasoning that the corrector needs.
+def build_correction_messages(
+    problem,
+    solution,
+    verification,
+    computational_report=None,
+):
     bug_report = verification.strip()
     user2 = correction_prompt.strip() + DNL + DIV + "### Full Verification Report ###" + DNL + bug_report
-    if cas_feedback:
-        user2 += DNL + DIV + "### CAS Verification Failure ###" + DNL + "The following algebraic claims in your previous correction FAILED computational verification:" + DNL + DNL + cas_feedback + DNL + DNL + "You MUST fix these failures. Do not assert identities without verifying them computationally."
+    if computational_report:
+        user2 += (
+            DNL + DIV + "### Untrusted Computational Evidence ###" + DNL
+            + computational_report.strip()
+            + DNL
+            + "Use this evidence to locate the issue, but include a complete "
+            + "human-readable derivation in the corrected proof."
+        )
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": problem.strip()},
@@ -414,10 +672,22 @@ def build_correction_messages(problem, solution, verification, cas_feedback=None
     ]
 
 
-def build_refinement_messages(problem, solution, verification):
-    # Gap 7: Send the ENTIRE verification to the refiner.
+def build_refinement_messages(
+    problem,
+    solution,
+    verification,
+    computational_report=None,
+):
     bug_report = verification.strip()
     user2 = refinement_prompt.strip() + DNL + DIV + "### Full Verification Report ###" + DNL + bug_report
+    if computational_report:
+        user2 += (
+            DNL + DIV + "### Untrusted Computational Evidence ###" + DNL
+            + computational_report.strip()
+            + DNL
+            + "Incorporate an explicit mathematical derivation; do not cite "
+            + "the computation as the proof."
+        )
     return [
         {"role": "system", "content": step1_prompt.strip()},
         {"role": "user", "content": problem.strip()},
@@ -426,7 +696,27 @@ def build_refinement_messages(problem, solution, verification):
     ]
 
 
-def build_lean_formalization_messages(problem, solution):
+def build_lean_statement_messages(problem):
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert Lean 4 and Mathlib formalizer. "
+                "Output only the requested theorem-statement prefix."
+            ),
+        },
+        {
+            "role": "user",
+            "content": lean_statement_prompt.strip() + DNL + problem.strip(),
+        },
+    ]
+
+
+def build_lean_formalization_messages(
+    problem,
+    solution,
+    frozen_statement,
+):
     return [
         {
             "role": "system",
@@ -435,14 +725,23 @@ def build_lean_formalization_messages(problem, solution):
         {
             "role": "user",
             "content": (
-                lean_formalize_prompt.strip() + DNL + problem.strip() + DNL
-                + DIV + "### Informal Solution ###" + DNL + solution.strip()
+                lean_formalize_prompt.strip() + DNL
+                + frozen_statement.strip() + DNL
+                + DIV + "### Original Problem ###" + DNL + problem.strip()
+                + DNL + DIV + "### Informal Solution ###" + DNL
+                + solution.strip()
             ),
         },
     ]
 
 
-def build_lean_repair_messages(problem, solution, lean_source, report):
+def build_lean_repair_messages(
+    problem,
+    solution,
+    frozen_statement,
+    lean_source,
+    report,
+):
     return [
         {
             "role": "system",
@@ -451,7 +750,11 @@ def build_lean_repair_messages(problem, solution, lean_source, report):
         {
             "role": "user",
             "content": (
-                lean_repair_prompt.strip() + DNL + problem.strip() + DNL
+                lean_repair_prompt.strip() + DNL
+                + DIV + "### Frozen Lean Statement Prefix ###" + DNL
+                + frozen_statement.strip() + DNL
+                + DIV + "### Original Problem ###" + DNL + problem.strip()
+                + DNL
                 + DIV + "### Informal Solution ###" + DNL + solution.strip() + DNL
                 + DIV + "### Broken Lean Source ###" + DNL + lean_source.strip() + DNL
                 + DIV + "### Formal Verification Report ###" + DNL + report.strip()
@@ -462,37 +765,188 @@ def build_lean_repair_messages(problem, solution, lean_source, report):
 
 # -- Solver loop --
 
-def execute_python_code(code, timeout=VALIDATION_TIMEOUT):
-    """Execute Python code in a subprocess. Returns (stdout, stderr, returncode)."""
-    # Strip markdown fences if present
-    lines = code.split(chr(10))
-    bt3 = chr(96) * 3
-    if lines and lines[0].startswith(bt3):
-        lines = lines[1:]
-    if lines and lines[-1].strip() == bt3:
-        lines = lines[:-1]
-    code = chr(10).join(lines).strip()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-        f.write(code)
-        f.flush()
-        script_path = f.name
+SAFE_PYTHON_IMPORTS = {
+    "collections",
+    "decimal",
+    "fractions",
+    "functools",
+    "heapq",
+    "itertools",
+    "math",
+    "operator",
+    "random",
+    "statistics",
+    "sympy",
+}
+FORBIDDEN_PYTHON_NAMES = {
+    "__import__",
+    "breakpoint",
+    "compile",
+    "delattr",
+    "eval",
+    "exec",
+    "getattr",
+    "globals",
+    "help",
+    "input",
+    "locals",
+    "memoryview",
+    "open",
+    "setattr",
+    "vars",
+}
+FORBIDDEN_PYTHON_ATTRIBUTES = {
+    "environ",
+    "getenv",
+    "import_module",
+    "popen",
+    "spawn",
+    "system",
+}
+
+
+def python_policy_violations(code):
     try:
-        result = subprocess.run(
-            ["python3", script_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        tree = ast.parse(strip_code_fences(code))
+    except SyntaxError as exc:
+        return [f"syntax error: {exc.msg}"]
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root not in SAFE_PYTHON_IMPORTS:
+                    violations.append(f"forbidden import: {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".", 1)[0]
+            if root not in SAFE_PYTHON_IMPORTS:
+                violations.append(f"forbidden import: {node.module}")
+        elif isinstance(node, ast.Name):
+            if node.id in FORBIDDEN_PYTHON_NAMES or node.id.startswith("__"):
+                violations.append(f"forbidden name: {node.id}")
+        elif isinstance(node, ast.Attribute) and (
+            node.attr.startswith("_")
+            or node.attr in FORBIDDEN_PYTHON_ATTRIBUTES
+        ):
+            violations.append(f"forbidden attribute: {node.attr}")
+    return sorted(set(violations))
+
+
+def _sandbox_profile(readable_paths, writable_paths):
+    def subpath(path):
+        return f"(subpath {json.dumps(str(Path(path).resolve()))})"
+
+    resolved_home = Path.home().resolve()
+    home = subpath(resolved_home)
+    read_exceptions = " ".join(
+        f"(require-not {subpath(path)})" for path in readable_paths
+    )
+    read_exceptions += (
+        f" (require-not (literal {json.dumps(str(resolved_home))}))"
+    )
+    write_exceptions = " ".join(
+        f"(require-not {subpath(path)})" for path in writable_paths
+    )
+    return (
+        "(version 1)\n"
+        "(allow default)\n"
+        "(deny network*)\n"
+        "(deny process-fork)\n"
+        f"(deny file-read* (require-all {home} {read_exceptions}))\n"
+        f"(deny file-write* (require-all {write_exceptions}))\n"
+    )
+
+
+def _sandboxed_command(command, readable_paths, writable_paths):
+    sandbox_exec = shutil.which("sandbox-exec")
+    if not sandbox_exec:
+        return None
+    profile = _sandbox_profile(readable_paths, writable_paths)
+    return [sandbox_exec, "-p", profile, *command]
+
+
+def _restricted_environment(home, extra=None):
+    environment = {
+        "HOME": str(home),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONNOUSERSITE": "1",
+    }
+    if extra:
+        environment.update(extra)
+    return environment
+
+
+def execute_python_code(
+    code,
+    timeout=VALIDATION_TIMEOUT,
+    output_limit=VALIDATION_OUTPUT_LIMIT,
+):
+    """Execute policy-checked Python in an OS sandbox.
+
+    Returns rc=-2 when no supported sandbox is available or the source violates
+    policy. Generated code is never executed directly on the host.
+    """
+    source = strip_code_fences(code)
+    violations = python_policy_violations(source)
+    if violations:
+        return "", "Policy failure:\n" + "\n".join(violations), -2
+
+    with tempfile.TemporaryDirectory(prefix="imo26-python-") as directory:
+        work_dir = Path(directory)
+        script_path = work_dir / "validation.py"
+        script_path.write_text(source, encoding="utf-8")
+        readable = [
+            work_dir,
+            "/System",
+            "/usr",
+            "/opt/homebrew",
+            "/private/var/db/timezone",
+        ]
+        command = _sandboxed_command(
+            [sys.executable, "-I", str(script_path)],
+            readable,
+            [work_dir],
         )
-        return result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired:
-        return "", f"Timeout after {timeout}s", -1
-    except Exception as e:
-        return "", str(e), -1
-    finally:
+        if not command:
+            return "", "No supported OS sandbox is available.", -2
         try:
-            os.unlink(script_path)
-        except OSError:
-            pass
+            stdout_path = work_dir / "stdout.txt"
+            stderr_path = work_dir / "stderr.txt"
+            with (
+                open(stdout_path, "wb") as stdout_handle,
+                open(stderr_path, "wb") as stderr_handle,
+            ):
+                result = subprocess.run(
+                    command,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    timeout=timeout,
+                    cwd=work_dir,
+                    env=_restricted_environment(work_dir),
+                )
+            if (
+                stdout_path.stat().st_size > output_limit
+                or stderr_path.stat().st_size > output_limit
+            ):
+                return (
+                    "",
+                    "Sandbox output exceeded "
+                    f"{output_limit} bytes and was discarded.",
+                    -3,
+                )
+            stdout_bytes = stdout_path.read_bytes()
+            stderr_bytes = stderr_path.read_bytes()
+            return (
+                stdout_bytes.decode("utf-8", errors="replace"),
+                stderr_bytes.decode("utf-8", errors="replace"),
+                result.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return "", f"Timeout after {timeout}s", -1
+        except OSError as exc:
+            return "", str(exc), -1
 
 
 def strip_code_fences(code):
@@ -504,26 +958,147 @@ def strip_code_fences(code):
     return "\n".join(lines).strip()
 
 
+def _strip_lean_comments_and_strings(code):
+    output = []
+    index = 0
+    block_depth = 0
+    in_string = False
+    while index < len(code):
+        pair = code[index:index + 2]
+        char = code[index]
+        if block_depth:
+            if pair == "/-":
+                block_depth += 1
+                index += 2
+            elif pair == "-/":
+                block_depth -= 1
+                index += 2
+            else:
+                index += 1
+            output.append(" ")
+            continue
+        if in_string:
+            if char == "\\":
+                index += 2
+            else:
+                in_string = char != '"'
+                index += 1
+            output.append(" ")
+            continue
+        if pair == "--":
+            newline = code.find("\n", index)
+            if newline == -1:
+                output.append(" ")
+                break
+            output.append("\n")
+            index = newline + 1
+        elif pair == "/-":
+            block_depth = 1
+            output.append(" ")
+            index += 2
+        elif char == '"':
+            in_string = True
+            output.append(" ")
+            index += 1
+        else:
+            output.append(char)
+            index += 1
+    return "".join(output)
+
+
+def validate_lean_statement_prefix(code):
+    """Return a canonical freezeable theorem prefix and policy failures."""
+    source = strip_code_fences(code).strip()
+    violations = lean_policy_violations(source)
+    if "--" in source or "/-" in source:
+        violations.append("comments are not allowed in a frozen statement")
+    if not re.match(
+        r"\Aimport Mathlib\s*\n"
+        r"set_option autoImplicit false\s*\n"
+        r"theorem imo_problem\b",
+        source,
+    ):
+        violations.append(
+            "statement must contain only the required import, option, and "
+            "imo_problem theorem prefix"
+        )
+    without_comments = _strip_lean_comments_and_strings(source)
+    if len(re.findall(r"\btheorem\b", without_comments)) != 1:
+        violations.append("statement must declare exactly one theorem")
+    if not re.search(r":=\s*by\s*\Z", without_comments):
+        violations.append("statement must end exactly at `:= by`")
+    return source, sorted(set(violations))
+
+
+def lean_source_preserves_frozen_statement(code, frozen_statement):
+    """Require generated proof source to preserve the reviewed prefix exactly."""
+    source = strip_code_fences(code).strip()
+    prefix = frozen_statement.strip()
+    suffix = source[len(prefix):] if source.startswith(prefix) else ""
+    return (
+        source.startswith(prefix)
+        and bool(suffix)
+        and suffix[0].isspace()
+        and bool(suffix.strip())
+    )
+
+
 def lean_policy_violations(code):
-    without_comments = re.sub(r"--.*?$|/-.*?-/", "", code, flags=re.MULTILINE | re.DOTALL)
+    source = strip_code_fences(code)
+    without_comments = _strip_lean_comments_and_strings(source)
     violations = []
     for token in ("sorry", "admit", "axiom", "opaque", "unsafe"):
         if re.search(rf"\b{token}\b", without_comments):
             violations.append(f"forbidden token: {token}")
+    risky_patterns = {
+        r"\brun_cmd\b": "command execution",
+        r"\brun_tac\b": "tactic-time command execution",
+        r"#(?:eval|run)\b": "evaluation command",
+        r"\b(?:elab|by_elab|elab_rules|syntax|macro|macro_rules|"
+        r"initialize|builtin_initialize|extern)\b":
+            "metaprogramming or initialization",
+        r"\bimplemented_by\b": "alternate implementation",
+        r"\b(?:include_str|include_bytes)\b": "compile-time file access",
+        r"\bnative_decide\b": "native code execution",
+        r"\b(?:IO|System|FilePath|Process)\b": "host I/O access",
+    }
+    for pattern, label in risky_patterns.items():
+        if re.search(pattern, without_comments):
+            violations.append(f"forbidden Lean feature: {label}")
     if re.search(r"\bset_option\s+autoImplicit\s+true\b", without_comments):
         violations.append("autoImplicit may not be enabled")
     if not re.search(r"\btheorem\s+imo_problem\b", without_comments):
         violations.append("missing theorem named imo_problem")
+    if not re.match(r"\s*import\s+Mathlib\b", without_comments):
+        violations.append("source must begin with `import Mathlib`")
     return violations
+
+
+LEAN_DECLARATION_CHECK = """
+
+open Lean Elab Command in
+run_cmd
+  let env ← getEnv
+  match env.find? `imo_problem with
+  | some (.thmInfo info) =>
+      logInfo m!"IMO_DECLARATION_OK"
+      logInfo m!"IMO_STATEMENT_BEGIN\n{info.type}\nIMO_STATEMENT_END"
+  | some _ => throwError "imo_problem is not a theorem"
+  | none => throwError "missing theorem named imo_problem"
+
+#print axioms imo_problem
+"""
 
 
 def execute_lean_code(code, source_path, lean_project, timeout=LEAN_TIMEOUT):
     """Compile a generated proof locally using elan/lake and reject proof holes."""
     source = strip_code_fences(code)
-    source_path.write_text(source, encoding="utf-8")
+    source_path.parent.mkdir(parents=True, exist_ok=True)
     violations = lean_policy_violations(source)
     if violations:
         return False, "Policy failure:\n" + "\n".join(f"- {item}" for item in violations)
+    checked_source = source + LEAN_DECLARATION_CHECK
+    source_path.write_text(checked_source, encoding="utf-8")
 
     lake = shutil.which("lake")
     if not lake:
@@ -535,13 +1110,58 @@ def execute_lean_code(code, source_path, lean_project, timeout=LEAN_TIMEOUT):
     if not (lean_project / "lakefile.lean").is_file():
         return False, f"Local Lean project unavailable: {lean_project / 'lakefile.lean'} not found."
 
+    elan_home = Path(os.environ.get("ELAN_HOME", Path.home() / ".elan"))
+    lake_env = _restricted_environment(
+        Path.home(),
+        {"ELAN_HOME": str(elan_home)},
+    )
+    try:
+        lean_binary = subprocess.run(
+            [lake, "env", "which", "lean"],
+            cwd=lean_project,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env=lake_env,
+        ).stdout.strip()
+        for name in ("LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT"):
+            value = subprocess.run(
+                [lake, "env", "printenv", name],
+                cwd=lean_project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                env=lake_env,
+            ).stdout.strip()
+            lake_env[name] = value
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"Could not resolve the pinned Lean environment: {exc}"
+
+    command = _sandboxed_command(
+        [lean_binary, str(source_path.resolve())],
+        [
+            "/System",
+            "/usr",
+            "/opt/homebrew",
+            lean_project.parent,
+            lean_project,
+            source_path.parent,
+            elan_home,
+        ],
+        [source_path.parent],
+    )
+    if not command:
+        return False, "Local Lean sandbox unavailable: sandbox-exec was not found."
     try:
         result = subprocess.run(
-            [lake, "env", "lean", str(source_path.resolve())],
+            command,
             cwd=lean_project,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=lake_env,
         )
     except subprocess.TimeoutExpired:
         return False, f"Local Lean timeout after {timeout}s."
@@ -551,9 +1171,19 @@ def execute_lean_code(code, source_path, lean_project, timeout=LEAN_TIMEOUT):
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
         return False, f"Local Lean failed (rc={result.returncode}):\n{output}"
-    if "declaration uses 'sorry'" in output:
+    if "declaration uses 'sorry'" in output or "IMO_DECLARATION_OK" not in output:
         return False, f"Local Lean rejected a proof hole:\n{output}"
-    return True, "Local Lean compiled `imo_problem` without proof holes." + (
+    statement_match = re.search(
+        r"IMO_STATEMENT_BEGIN\s*(.*?)\s*IMO_STATEMENT_END",
+        output,
+        re.DOTALL,
+    )
+    statement = statement_match.group(1).strip() if statement_match else ""
+    statement_hash = sha256_text(statement) if statement else ""
+    return True, (
+        "Local Lean compiled an actual theorem `imo_problem` without proof "
+        f"holes. Statement SHA-256: {statement_hash or 'unavailable'}."
+    ) + (
         "\nCompiler output:\n" + output if output else ""
     )
 
@@ -620,101 +1250,327 @@ def execute_axle_check(code, environment, timeout=LEAN_TIMEOUT):
     return bool(result.okay and not failed), report
 
 
-def pre_solve_validation(problem, api_url, api_key, model, run_dir, outer_run):
-    """Core Fix A: Generate and execute a validation script that computes
-    small cases before SOLVE. Returns the computational results as a string,
-    or None if validation fails."""
-    log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: start")
+def save_execution_artifacts(
+    directory,
+    stem,
+    source,
+    stdout="",
+    stderr="",
+    metadata=None,
+):
+    save_text(directory, f"{stem}.py", strip_code_fences(source))
+    save_text(directory, f"{stem}.stdout.txt", stdout)
+    save_text(directory, f"{stem}.stderr.txt", stderr)
+    if metadata is not None:
+        save_text(
+            directory,
+            f"{stem}.json",
+            json.dumps(metadata, indent=2, ensure_ascii=False),
+        )
+
+
+def pre_solve_validation(
+    problem,
+    api_url,
+    api_key,
+    model,
+    run_dir,
+    outer_run,
+    usage_ledger=None,
+    validation_enabled=True,
+):
+    """Generate, sandbox, and preserve small-case evidence before SOLVE."""
+    label = f"RUN {outer_run} EMPIRICAL_PROBE"
+    subdir = run_dir / f"run_{outer_run:02d}"
+    subdir.mkdir(exist_ok=True)
+    log_progress(run_dir, f"{label}: start")
+    if not validation_enabled:
+        log_progress(run_dir, f"{label}: skipped by --validation-mode off")
+        return None
     messages = [
-        {"role": "system", "content": "You are a Python programmer. Write self-contained, executable Python code only."},
-        {"role": "user", "content": empirical_probe_prompt.strip() + DNL + DIV + "### Problem ###" + DNL + problem.strip()},
+        {
+            "role": "system",
+            "content": "Write self-contained executable Python code only.",
+        },
+        {
+            "role": "user",
+            "content": (
+                empirical_probe_prompt.strip()
+                + DNL + DIV + "### Problem ###" + DNL + problem.strip()
+            ),
+        },
     ]
+    content = ""
+    reasoning_path = subdir / "reasoning_EMPIRICAL_PROBE.txt"
     try:
-        probe_rpath = run_dir / f"reasoning_PROBE_run{outer_run:02d}.txt"
         content, usage, finish = chat_completion(
-            api_url, api_key, model, messages,
-            log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
+            api_url,
+            api_key,
+            model,
+            messages,
+            log_fn=lambda message: log_progress(
+                run_dir, f"{label}: {message}"
+            ),
             max_tokens=VALIDATION_MAX_TOKENS,
             thinking_budget=VALIDATION_THINKING_BUDGET,
-            reasoning_path=probe_rpath,
+            reasoning_path=reasoning_path,
         )
-        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {usage.get("total_tokens", 0)} tokens finish={finish}")
-        if finish == "length":
-            # Fix 1: Universal truncation retry with feedback + halved budget
-            probe_tokens = usage.get("total_tokens", 0)
-            truncation_feedback = f"Your previous attempt generated {probe_tokens} tokens and was truncated. Generate much shorter code — use the simplest possible approach, under 100 lines, no comments."
-            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: truncated, retry with feedback + halved budget")
-            retry_messages = list(messages) + [
-                {"role": "user", "content": truncation_feedback}
-            ]
-            content, usage, finish = chat_completion(
-                api_url, api_key, model, retry_messages,
-                log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
+        if usage_ledger:
+            usage_ledger.record("EMPIRICAL_PROBE", usage, finish)
+        if finish != "stop":
+            partial_content = content if content.strip() else ""
+            retry_messages = list(messages)
+            if partial_content:
+                retry_messages.append(
+                    {"role": "assistant", "content": partial_content}
+                )
+                retry_instruction = (
+                    "Continue from the exact stopping point and finish the "
+                    "script without repeating prior code."
+                )
+            else:
+                reasoning_tail = ""
+                if reasoning_path.exists():
+                    reasoning_tail = reasoning_path.read_text(
+                        encoding="utf-8"
+                    )[-10000:]
+                retry_instruction = (
+                    "The prior response was incomplete. Return one complete "
+                    "concise script with no commentary. Stay within the "
+                    "original 150-line limit."
+                )
+                if reasoning_tail:
+                    retry_instruction += (
+                        "\n\nUse this prior reasoning tail:\n"
+                        + reasoning_tail
+                    )
+            retry_messages.append(
+                {"role": "user", "content": retry_instruction}
+            )
+            continued_content, usage, finish = chat_completion(
+                api_url,
+                api_key,
+                model,
+                retry_messages,
+                log_fn=lambda message: log_progress(
+                    run_dir, f"{label} RETRY: {message}"
+                ),
                 max_tokens=VALIDATION_MAX_TOKENS // 2,
                 thinking_budget=VALIDATION_THINKING_BUDGET,
-                reasoning_path=run_dir / f"reasoning_PROBE_run{outer_run:02d}_trunc_retry.txt",
+                reasoning_path=subdir / "reasoning_EMPIRICAL_PROBE_retry.txt",
             )
-            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: retry {usage.get("total_tokens", 0)} tokens finish={finish}")
+            if usage_ledger:
+                usage_ledger.record(
+                    "EMPIRICAL_PROBE_RETRY", usage, finish
+                )
+            content = (
+                partial_content + continued_content
+                if partial_content and finish == "stop"
+                else continued_content
+            )
+        if finish != "stop":
+            save_execution_artifacts(
+                subdir,
+                "empirical_probe",
+                content,
+                metadata={"finish_reason": finish, "executed": False},
+            )
+            log_progress(run_dir, f"{label}: incomplete response, skipped")
+            return None
         stdout, stderr, rc = execute_python_code(content)
+        save_execution_artifacts(
+            subdir,
+            "empirical_probe",
+            content,
+            stdout,
+            stderr,
+            {"finish_reason": finish, "returncode": rc, "executed": True},
+        )
         if rc == 0 and stdout.strip():
             result = stdout.strip()
-            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: success, {len(result)} chars output")
+            log_progress(
+                run_dir,
+                f"{label}: sandboxed evidence produced {len(result)} chars",
+            )
             return result
-        else:
-            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: code execution failed (rc={rc}), stderr={stderr[:200]}")
-            return None
-    except _WallClockTimeout as wc_exc:
-        # Gap O + Gap P: Wall-clock timeout on EMPIRICAL_PROBE — retry with
-        # partial content carried forward (if any) and halved budget.
-        partial = wc_exc.partial_content
-        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: wall-clock timeout (partial: {len(partial)} chars content, {len(wc_exc.partial_reasoning)} chars reasoning), retry with halved budget")
-        if partial.strip():
+        log_progress(
+            run_dir,
+            f"{label}: sandboxed execution failed (rc={rc})",
+        )
+    except _WallClockTimeout as exc:
+        if usage_ledger:
+            usage_ledger.record(
+                "EMPIRICAL_PROBE",
+                finish="timeout",
+                status="timeout",
+            )
+        save_execution_artifacts(
+            subdir,
+            "empirical_probe_partial",
+            exc.partial_content,
+            metadata={
+                "finish_reason": "timeout",
+                "reasoning_chars": len(exc.partial_reasoning),
+                "executed": False,
+            },
+        )
+        log_progress(
+            run_dir,
+            f"{label}: wall-clock timeout "
+            f"({len(exc.partial_content)} content chars, "
+            f"{len(exc.partial_reasoning)} reasoning chars); retrying",
+        )
+        if exc.partial_content.strip():
             retry_messages = list(messages) + [
-                {"role": "assistant", "content": partial},
-                {"role": "user", "content": "Continue and complete your code from where you left off. Do not repeat what you already wrote."}
+                {
+                    "role": "assistant",
+                    "content": exc.partial_content,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue from the exact stopping point and finish the "
+                        "Python script. Do not repeat prior code."
+                    ),
+                },
             ]
-        elif wc_exc.partial_reasoning.strip():
-            # Gap Q: Model produced reasoning but no visible code. Inject reasoning tail.
-            reasoning_tail = wc_exc.partial_reasoning[-10000:]
+        elif exc.partial_reasoning.strip():
+            reasoning_tail = exc.partial_reasoning[-10000:]
             retry_messages = list(messages) + [
-                {"role": "user", "content": "Your previous attempt spent a long time reasoning but produced no code. Here is the tail of your reasoning:" + chr(10) + chr(10) + reasoning_tail + chr(10) + chr(10) + "Based on this reasoning, write the complete Python script now. Output only the code."}
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous attempt timed out during reasoning. "
+                        "Using this reasoning tail, return only one complete "
+                        "concise Python script:\n\n" + reasoning_tail
+                    ),
+                },
             ]
         else:
             retry_messages = list(messages) + [
-                {"role": "user", "content": "Your previous attempt timed out. Generate much shorter code — use the simplest possible approach, under 50 lines, no comments."}
+                {
+                    "role": "user",
+                    "content": (
+                        "Return one complete concise Python script now, with "
+                        "no commentary."
+                    ),
+                },
             ]
         try:
-            content, usage, finish = chat_completion(
-                api_url, api_key, model, retry_messages,
-                log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: {msg}"),
+            continued_content, usage, finish = chat_completion(
+                api_url,
+                api_key,
+                model,
+                retry_messages,
+                log_fn=lambda message: log_progress(
+                    run_dir, f"{label} TIMEOUT_RETRY: {message}"
+                ),
                 max_tokens=VALIDATION_MAX_TOKENS // 2,
                 thinking_budget=VALIDATION_THINKING_BUDGET,
-                reasoning_path=run_dir / f"reasoning_PROBE_run{outer_run:02d}_wc_retry.txt",
+                reasoning_path=(
+                    subdir / "reasoning_EMPIRICAL_PROBE_timeout_retry.txt"
+                ),
             )
-            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry {usage.get('total_tokens', 0)} tokens finish={finish}")
-            if partial.strip():
-                content = partial + content
+            if usage_ledger:
+                usage_ledger.record(
+                    "EMPIRICAL_PROBE_TIMEOUT_RETRY",
+                    usage,
+                    finish,
+                )
+            content = (
+                exc.partial_content + continued_content
+                if exc.partial_content.strip() and finish == "stop"
+                else continued_content
+            )
+            if finish != "stop":
+                save_execution_artifacts(
+                    subdir,
+                    "empirical_probe_timeout_retry",
+                    content,
+                    metadata={
+                        "finish_reason": finish,
+                        "executed": False,
+                    },
+                )
+                log_progress(
+                    run_dir,
+                    f"{label}: timeout retry incomplete, skipped",
+                )
+                return None
             stdout, stderr, rc = execute_python_code(content)
+            save_execution_artifacts(
+                subdir,
+                "empirical_probe",
+                content,
+                stdout,
+                stderr,
+                {
+                    "finish_reason": finish,
+                    "returncode": rc,
+                    "executed": True,
+                    "source": "timeout_retry",
+                },
+            )
             if rc == 0 and stdout.strip():
                 result = stdout.strip()
-                log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: success after timeout retry, {len(result)} chars output")
+                log_progress(
+                    run_dir,
+                    f"{label}: timeout retry produced "
+                    f"{len(result)} chars of sandboxed evidence",
+                )
                 return result
-            else:
-                log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry code execution failed (rc={rc}), stderr={stderr[:200]}")
-                return None
-        except Exception as e:
-            log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: timeout retry error: {e}")
-            return None
-    except Exception as e:
-        log_progress(run_dir, f"RUN {outer_run} EMPIRICAL_PROBE: error: {e}")
-        return None
+            log_progress(
+                run_dir,
+                f"{label}: timeout retry execution failed (rc={rc})",
+            )
+        except _WallClockTimeout as retry_exc:
+            if usage_ledger:
+                usage_ledger.record(
+                    "EMPIRICAL_PROBE_TIMEOUT_RETRY",
+                    finish="timeout",
+                    status="timeout",
+                )
+            save_execution_artifacts(
+                subdir,
+                "empirical_probe_timeout_retry_partial",
+                retry_exc.partial_content,
+                metadata={
+                    "finish_reason": "timeout",
+                    "reasoning_chars": len(
+                        retry_exc.partial_reasoning
+                    ),
+                    "executed": False,
+                },
+            )
+            log_progress(
+                run_dir,
+                f"{label}: timeout retry also timed out, skipped",
+            )
+    except (InfrastructureError, ConfigurationError):
+        raise
+    except Exception as exc:
+        log_progress(run_dir, f"{label}: error: {exc}")
+    return None
 
 
-def cas_verify_candidate(candidate, api_url, api_key, model, run_dir, outer_run, iteration):
-    """Core Fix D: Generate and execute SymPy verification code for algebraic
-    claims in the candidate. Returns (all_pass, details_string)."""
+def cas_verify_candidate(
+    candidate,
+    api_url,
+    api_key,
+    model,
+    run_dir,
+    outer_run,
+    iteration,
+    usage_ledger=None,
+    validation_enabled=True,
+):
+    """Generate and sandbox a SymPy audit; return fail-closed evidence."""
     label = f"ITER {iteration}" if iteration else "initial"
     log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: start")
+    if not validation_enabled:
+        return True, "CAS verification skipped by --validation-mode off."
+    subdir = run_dir / f"run_{outer_run:02d}"
+    artifact_stem = f"cas_verify_{iteration:02d}"
     detailed = extract_section(candidate, "Detailed Solution")
     if not detailed:
         detailed = candidate.strip()
@@ -730,41 +1586,86 @@ def cas_verify_candidate(candidate, api_url, api_key, model, run_dir, outer_run,
             thinking_budget=VALIDATION_THINKING_BUDGET,
             reasoning_path=run_dir / f"run_{outer_run:02d}" / f"reasoning_CAS_VERIFY_{label.replace(' ', '_')}.txt",
         )
-        log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: {usage.get("total_tokens", 0)} tokens finish={finish}")
+        if usage_ledger:
+            usage_ledger.record(f"{label} CAS_VERIFY", usage, finish)
+        if finish != "stop":
+            save_execution_artifacts(
+                subdir,
+                artifact_stem,
+                content,
+                metadata={"finish_reason": finish, "executed": False},
+            )
+            return False, (
+                f"CAS verification response was incomplete "
+                f"(finish={finish}); it was not executed."
+            )
         stdout, stderr, rc = execute_python_code(content)
+        save_execution_artifacts(
+            subdir,
+            artifact_stem,
+            content,
+            stdout,
+            stderr,
+            {"finish_reason": finish, "returncode": rc, "executed": True},
+        )
         if rc == 0 and stdout.strip():
-            output = stdout.strip()
-            if "NO_ALGEBRAIC_CLAIMS" in output:
+            lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+            if lines == ["NO_ALGEBRAIC_CLAIMS"]:
                 log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: no algebraic claims found")
-                return True, ""
-            elif "FAIL:" in output:
+                return True, "CAS extraction reported no algebraic claims."
+            if any(line.startswith("FAIL:") for line in lines):
                 log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: FAIL detected")
-                return False, output
-            else:
+                return False, stdout.strip()
+            if lines and all(
+                line.startswith("PASS:")
+                and line[len("PASS:"):].strip()
+                for line in lines
+            ):
                 log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: all claims PASS")
-                return True, output
-        else:
-            if finish == "length":
-                log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: code truncated (finish=length), treating as FAIL")
-                return False, "CAS verification code was truncated (finish=length). Please generate shorter, more compact SymPy code."
-            log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: code execution failed (rc={rc})")
-            return False, f"CAS verification code crashed on execution (rc={rc}). Error: {stderr[:500]}. Please generate correct, executable SymPy code."
-    except Exception as e:
-        log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: error: {e}")
-        return False, f"CAS verification encountered an error: {e}. Please generate correct, executable SymPy code."
+                return True, stdout.strip()
+            return False, (
+                "CAS output did not contain explicit PASS/FAIL lines."
+            )
+        return False, (
+            f"CAS script failed in the sandbox (rc={rc}): {stderr[:500]}"
+        )
+    except (InfrastructureError, ConfigurationError):
+        raise
+    except Exception as exc:
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_VERIFY: error: {exc}")
+        return False, f"CAS verification error: {exc}"
 
 
-def cas_compute_gap(candidate, verification, api_url, api_key, model, run_dir, outer_run, iteration):
-    """Fix 2: When VERIFY finds only Justification Gaps (no Critical Errors),
-    attempt to directly verify the incomplete identity using SymPy.
-    Returns augmented candidate if identity confirmed, None otherwise."""
+def cas_compute_gap(
+    candidate,
+    verification,
+    api_url,
+    api_key,
+    model,
+    run_dir,
+    outer_run,
+    iteration,
+    usage_ledger=None,
+    validation_enabled=True,
+):
+    """Produce preserved computational evidence without modifying the proof."""
     label = f"ITER {iteration}" if iteration else "initial"
 
-    # Only attempt when verification has Justification Gap but no Critical Error
-    if "Critical Error" in verification or "Justification Gap" not in verification:
+    if (
+        not validation_enabled
+        or "Critical Error" in verification
+        or "Justification Gap" not in verification
+        or not re.search(
+            r"identity|algebra|expand|comput|polynomial|simplif",
+            verification,
+            re.IGNORECASE,
+        )
+    ):
         return None
 
     log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: start")
+    subdir = run_dir / f"run_{outer_run:02d}"
+    artifact_stem = f"cas_compute_{iteration:02d}"
     detailed = extract_section(candidate, "Detailed Solution")
     if not detailed:
         detailed = candidate.strip()
@@ -780,82 +1681,95 @@ def cas_compute_gap(candidate, verification, api_url, api_key, model, run_dir, o
             thinking_budget=VALIDATION_THINKING_BUDGET,
             reasoning_path=run_dir / f"run_{outer_run:02d}" / f"reasoning_CAS_COMPUTE_{label.replace(' ', '_')}.txt",
         )
-        probe_tokens = usage.get('total_tokens', 0)
-        log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {probe_tokens} tokens finish={finish}")
+        if usage_ledger:
+            usage_ledger.record(f"{label} CAS_COMPUTE", usage, finish)
         if finish == "length":
-            # Fix 1: truncation retry with feedback + halved budget
-            truncation_feedback = f"Your previous attempt generated {probe_tokens} tokens and was truncated. Generate much shorter code."
             log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: truncated, retry with halved budget")
-            retry_messages = list(messages) + [{"role": "user", "content": truncation_feedback}]
-            content, usage, finish = chat_completion(
+            retry_messages = list(messages)
+            if content.strip():
+                retry_messages.append(
+                    {"role": "assistant", "content": content}
+                )
+                retry_instruction = (
+                    "Continue from the exact stopping point and finish the "
+                    "script without repeating prior code."
+                )
+            else:
+                retry_instruction = "Return a complete shorter script."
+            retry_messages.append(
+                {"role": "user", "content": retry_instruction}
+            )
+            partial_content = content if content.strip() else ""
+            continued_content, usage, finish = chat_completion(
                 api_url, api_key, model, retry_messages,
                 log_fn=lambda msg: log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: {msg}"),
                 max_tokens=VALIDATION_MAX_TOKENS // 2,
                 thinking_budget=VALIDATION_THINKING_BUDGET,
                 reasoning_path=run_dir / f"run_{outer_run:02d}" / f"reasoning_CAS_COMPUTE_{label.replace(' ', '_')}_retry.txt",
             )
-            probe_tokens = usage.get('total_tokens', 0)
-            log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: retry {probe_tokens} tokens finish={finish}")
+            if usage_ledger:
+                usage_ledger.record(
+                    f"{label} CAS_COMPUTE_RETRY", usage, finish
+                )
+            content = (
+                partial_content + continued_content
+                if partial_content and finish == "stop"
+                else continued_content
+            )
+        if finish != "stop":
+            save_execution_artifacts(
+                subdir,
+                artifact_stem,
+                content,
+                metadata={"finish_reason": finish, "executed": False},
+            )
+            return None
         stdout, stderr, rc = execute_python_code(content)
+        save_execution_artifacts(
+            subdir,
+            artifact_stem,
+            content,
+            stdout,
+            stderr,
+            {"finish_reason": finish, "returncode": rc, "executed": True},
+        )
         if rc == 0 and stdout.strip():
             output = stdout.strip()
-            if "IDENTITY_CONFIRMED" in output:
+            lines = [
+                line.strip()
+                for line in output.splitlines()
+                if line.strip()
+            ]
+            if (
+                len(lines) == 3
+                and lines[0].startswith("IDENTITY:")
+                and lines[0][len("IDENTITY:"):].strip()
+                and lines[1].startswith("ASSUMPTIONS:")
+                and lines[2] == "RESULT: CONFIRMED"
+            ):
                 log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: IDENTITY CONFIRMED")
-                augmented = candidate + chr(10) + chr(10) + "---" + chr(10)
-                augmented += "**CAS-Verified Identity:** The algebraic identity flagged as incomplete in the verification report has been computationally verified using SymPy. The expression simplifies to zero under the given constraints." + chr(10) + chr(10)
-                augmented += "SymPy verification output:" + chr(10) + "```" + chr(10) + output + chr(10) + "```"
-                return augmented
-            elif "IDENTITY_DENIED" in output:
+                return (
+                    "Sandboxed SymPy evidence (not a proof):\n" + output
+                )
+            if (
+                len(lines) == 3
+                and lines[0].startswith("IDENTITY:")
+                and lines[0][len("IDENTITY:"):].strip()
+                and lines[1].startswith("ASSUMPTIONS:")
+                and lines[2].startswith("RESULT: DENIED:")
+            ):
                 log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: IDENTITY DENIED")
-                return None
-            else:
-                log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: inconclusive output")
-                return None
-        else:
-            log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: code execution failed (rc={rc})")
-            return None
-    except Exception as e:
-        log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: error: {e}")
-        return None
-
-
-def extract_error_locations(verification):
-    """Core Fix B: Extract (step_number, error_type) pairs from verification text."""
-    locations = []
-    for match in re.finditer(r"\*\*Step (\d+)[^*]*\*\*.*?\*\*(Critical Error|Justification Gap)\*\*", verification, re.DOTALL):
-        locations.append((int(match.group(1)), match.group(2)))
-    for match in re.finditer(r"\*\*Location:.*?Step (\d+).*?\*\*\s*\n\s*\*\*Issue:\*\*\s*(Critical Error|Justification Gap)", verification, re.DOTALL):
-        step = int(match.group(1))
-        etype = match.group(2)
-        if (step, etype) not in locations:
-            locations.append((step, etype))
-    return locations
-
-
-def detect_structural_error(current_locations, previous_locations_list):
-    """Core Fix B: Detect if error pattern suggests a structural issue.
-    Returns (is_structural, reason)."""
-    if not current_locations:
-        return False, ""
-    current_steps = {loc[0] for loc in current_locations}
-    current_criticals = {loc[0] for loc in current_locations if loc[1] == "Critical Error"}
-    if previous_locations_list:
-        prev_steps = {loc[0] for loc in previous_locations_list[-1]}
-        overlap = current_steps & prev_steps
-        if overlap:
-            return True, f"Same step(s) {overlap} failed in consecutive iterations"
-    if 1 in current_criticals:
-        return True, "Critical Error in Step 1 (foundational)"
-    if previous_locations_list:
-        prev_criticals = {loc[0] for loc in previous_locations_list[-1] if loc[1] == "Critical Error"}
-        new_criticals = current_criticals - prev_criticals
-        if new_criticals:
-            return True, f"Correction introduced new Critical Error(s) in step(s) {new_criticals}"
-    return False, ""
+                return "Sandboxed SymPy evidence found a denial:\n" + output
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: inconclusive")
+    except (InfrastructureError, ConfigurationError):
+        raise
+    except Exception as exc:
+        log_progress(run_dir, f"RUN {outer_run} {label} CAS_COMPUTE: error: {exc}")
+    return None
 
 
 def read_failure_ledger(run_dir):
-    """Core Fix C: Read the failure ledger from the run directory."""
+    """Read cross-run failure context from this run directory."""
     ledger_path = run_dir / "failure_ledger.json"
     if not ledger_path.exists():
         return []
@@ -866,15 +1780,18 @@ def read_failure_ledger(run_dir):
 
 
 def write_failure_ledger(run_dir, entry):
-    """Core Fix C: Append an entry to the failure ledger."""
+    """Append cross-run failure context with an atomic file replacement."""
     ledger_path = run_dir / "failure_ledger.json"
     ledger = read_failure_ledger(run_dir)
     ledger.append(entry)
-    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_atomic_text(
+        ledger_path,
+        json.dumps(ledger, indent=2, ensure_ascii=False),
+    )
 
 
 def build_failure_ledger_context(ledger):
-    """Core Fix C: Build a context string from the failure ledger for SOLVE prompt."""
+    """Build concise prior-attempt context for a fresh SOLVE request."""
     if not ledger:
         return ""
     lines = ["### Prior Attempts (Cross-Run Knowledge) ###", ""]
@@ -883,7 +1800,10 @@ def build_failure_ledger_context(ledger):
         reason = entry.get("failure_reason", entry.get("errors", "unknown"))
         lines.append(f"Run {run}: {reason}")
         if entry.get("empirical_results"):
-            lines.append(f"  Computational ground truth: {entry['empirical_results']}")
+            lines.append(
+                "  Prior untrusted small-case evidence: "
+                f"{entry['empirical_results']}"
+            )
         lines.append("")
     return chr(10).join(lines)
 
@@ -906,12 +1826,7 @@ def extract_failure_reason(verification):
 
 
 def build_pivot_hint(failure_reason=None):
-    """Build a dynamic pivot hint, optionally including failure reason.
-    
-    Gap 2: failure_reason now includes accumulated reasons from all
-    failed iterations (up to last 3), giving the model more context
-    about what approaches didn't work.
-    """
+    """Build a different-approach hint with concise prior failures."""
     hint = PIVOT_HINT
     if failure_reason:
         hint += chr(10) + chr(10) + "Previous failure reason(s): " + failure_reason
@@ -932,6 +1847,10 @@ def run_outer(
     lean_project=None,
     axle_mode="off",
     axle_environment="lean-4.28.0",
+    self_improve_mode="recovery",
+    validation_enabled=True,
+    usage_ledger=None,
+    verifier_model=None,
 ):
     """Run one outer attempt. Returns (accepted, candidate, summary)."""
     if lean_mode == "off" and axle_mode != "off":
@@ -939,40 +1858,67 @@ def run_outer(
 
     subdir = run_dir / f"run_{outer_run:02d}"
     subdir.mkdir(exist_ok=True)
-
-    total_tokens = 0
+    usage_ledger = usage_ledger or UsageLedger()
+    verifier_model = verifier_model or model
     candidate_num = 0
     verify_num = 0
     pass_artifacts = []
     formal_cache = {}
     formal_gate_required = lean_mode == "required" or axle_mode == "required"
-
     _reasoning_seq = [0]
+
     def call(messages, label, max_tokens=None, thinking_budget=None):
-        nonlocal total_tokens
         def log_fn(msg):
             log_progress(run_dir, f"RUN {outer_run} {label}: {msg}")
-        # Fix 4: Catch wall-clock timeout — treat as truncation, don't propagate to main
+
+        call_model = (
+            verifier_model
+            if label.startswith("VERIFY ")
+            else model
+        )
+        resolved_max_tokens = max_tokens or MAX_TOKENS
+        resolved_thinking = thinking_budget or THINKING_BUDGET
         try:
             _reasoning_seq[0] += 1
             safe_label = label.replace(" ", "_")
             rpath = subdir / f"reasoning_{_reasoning_seq[0]:02d}_{safe_label}.txt"
-            content, usage, finish = chat_completion(api_url, api_key, model, messages, log_fn=log_fn, max_tokens=max_tokens, thinking_budget=thinking_budget, reasoning_path=rpath)
+            content, usage, finish = chat_completion(
+                api_url,
+                api_key,
+                call_model,
+                messages,
+                log_fn=log_fn,
+                max_tokens=resolved_max_tokens,
+                thinking_budget=resolved_thinking,
+                reasoning_path=rpath,
+            )
+            usage_ledger.record(
+                f"RUN {outer_run} {label}",
+                usage,
+                finish,
+            )
         except _WallClockTimeout as wc_exc:
-            # Gap P: Use partial streaming content as context for retry instead of starting from zero
             partial = wc_exc.partial_content
             partial_reasoning = wc_exc.partial_reasoning
-            log_progress(run_dir, f"RUN {outer_run} {label}: wall-clock timeout, treating as truncation (partial: {len(partial)} chars content, {len(partial_reasoning)} chars reasoning)")
+            usage_ledger.record(
+                f"RUN {outer_run} {label}",
+                finish="timeout",
+                status="timeout",
+            )
+            save_text(subdir, f"partial_{safe_label}.md", partial)
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} {label}: wall-clock timeout "
+                f"({len(partial)} content chars, "
+                f"{len(partial_reasoning)} reasoning chars)",
+            )
             try:
                 if partial.strip():
-                    # Include partial content as assistant message, ask to continue
                     retry_messages = list(messages) + [
                         {"role": "assistant", "content": partial},
                         {"role": "user", "content": "Continue and complete your response from where you left off. Do not repeat what you already wrote."}
                     ]
                 elif partial_reasoning.strip():
-                    # Gap Q: Model produced reasoning but no visible content. Inject the tail
-                    # of the reasoning as context so the model doesn't start from zero.
                     reasoning_tail = partial_reasoning[-10000:]
                     retry_messages = list(messages) + [
                         {"role": "user", "content": "Your previous attempt spent a long time reasoning but produced no final output. Here is the tail of your reasoning:" + chr(10) + chr(10) + reasoning_tail + chr(10) + chr(10) + "Based on this reasoning, write the complete solution now. Do not repeat the reasoning — output only the final solution."}
@@ -984,69 +1930,249 @@ def run_outer(
                     ]
                 _reasoning_seq[0] += 1
                 rpath_wc = subdir / f"reasoning_{_reasoning_seq[0]:02d}_{safe_label}_wc_retry.txt"
-                content2, usage2, finish2 = chat_completion(
-                    api_url, api_key, model, retry_messages, log_fn=log_fn, reasoning_path=rpath_wc
+                retry_max_tokens = max(8192, resolved_max_tokens // 2)
+                retry_thinking = min(
+                    resolved_thinking,
+                    retry_max_tokens - 8192,
                 )
-                tokens2 = usage2.get("total_tokens", 0)
-                total_tokens += tokens2
-                log_progress(run_dir, f"RUN {outer_run} {label}: timeout retry {tokens2} tokens finish={finish2}")
-                if content2.strip():
+                content2, usage2, finish2 = chat_completion(
+                    api_url,
+                    api_key,
+                    call_model,
+                    retry_messages,
+                    log_fn=log_fn,
+                    max_tokens=retry_max_tokens,
+                    thinking_budget=retry_thinking,
+                    reasoning_path=rpath_wc,
+                )
+                usage_ledger.record(
+                    f"RUN {outer_run} {label} TIMEOUT_RETRY",
+                    usage2,
+                    finish2,
+                )
+                if finish2 == "stop" and content2.strip():
                     if partial.strip():
                         return partial + content2
                     return content2
-            except _WallClockTimeout:
+            except _WallClockTimeout as retry_exc:
+                usage_ledger.record(
+                    f"RUN {outer_run} {label} TIMEOUT_RETRY",
+                    finish="timeout",
+                    status="timeout",
+                )
+                save_text(
+                    subdir,
+                    f"partial_{safe_label}_retry.md",
+                    retry_exc.partial_content,
+                )
                 log_progress(run_dir, f"RUN {outer_run} {label}: timeout retry also timed out")
-            return ""  # Empty → will fail verification → error_count increments, no full pivot
-        tokens = usage.get("total_tokens", 0)
-        total_tokens += tokens
-        log_progress(run_dir, f"RUN {outer_run} {label}: {tokens} tokens finish={finish}")
-        if finish == "length":
-            # Fix 1: Universal truncation retry with feedback + halved budget
-            truncation_feedback = f"Your previous attempt generated {tokens} tokens and was truncated. Be more concise — focus on the essential content and omit unnecessary detail."
-            log_progress(run_dir, f"RUN {outer_run} {label}: truncated, retry with feedback + halved budget")
-            retry_messages = list(messages) + [
-                {"role": "user", "content": truncation_feedback + chr(10) + chr(10) + NEUTRAL_COMPLETE_REQUEST}
-            ]
-            retry_max_tokens = max(8192, (max_tokens or MAX_TOKENS) // 2)
-            retry_thinking = min(thinking_budget or THINKING_BUDGET, retry_max_tokens - 8192)
+            return ""
+
+        log_progress(
+            run_dir,
+            f"RUN {outer_run} {label}: "
+            f"{usage.get('total_tokens', 0)} tokens finish={finish}",
+        )
+        if finish != "stop":
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} {label}: incomplete response, retrying",
+            )
+            retry_messages = list(messages)
+            if content.strip():
+                retry_messages.append(
+                    {"role": "assistant", "content": content}
+                )
+                retry_instruction = (
+                    "The response ended before completion. Continue from "
+                    "the exact stopping point and finish concisely. Do not "
+                    "repeat prior text."
+                )
+            else:
+                reasoning_tail = ""
+                if rpath.exists():
+                    reasoning_tail = rpath.read_text(
+                        encoding="utf-8"
+                    )[-10000:]
+                retry_instruction = (
+                    "The response ended during reasoning. Produce the "
+                    "complete requested output now."
+                )
+                if reasoning_tail:
+                    retry_instruction += (
+                        "\n\nUse this prior reasoning tail:\n"
+                        + reasoning_tail
+                    )
+            retry_messages.append(
+                {"role": "user", "content": retry_instruction}
+            )
+            retry_max_tokens = max(8192, resolved_max_tokens // 2)
+            retry_thinking = min(
+                resolved_thinking,
+                retry_max_tokens - 8192,
+            )
             _reasoning_seq[0] += 1
             rpath_tr = subdir / f"reasoning_{_reasoning_seq[0]:02d}_{safe_label}_trunc_retry.txt"
             content2, usage2, finish2 = chat_completion(
-                api_url, api_key, model, retry_messages, log_fn=log_fn,
+                api_url,
+                api_key,
+                call_model,
+                retry_messages,
+                log_fn=log_fn,
                 max_tokens=retry_max_tokens,
                 thinking_budget=retry_thinking,
                 reasoning_path=rpath_tr,
             )
-            tokens2 = usage2.get("total_tokens", 0)
-            total_tokens += tokens2
+            usage_ledger.record(
+                f"RUN {outer_run} {label} INCOMPLETE_RETRY",
+                usage2,
+                finish2,
+            )
+            if finish2 == "stop" and content2.strip():
+                return content + content2 if content.strip() else content2
             log_progress(
                 run_dir,
-                f"RUN {outer_run} {label}: retry {tokens2} tokens finish={finish2}",
+                f"RUN {outer_run} {label}: retry incomplete "
+                f"(finish={finish2}), failing closed",
             )
-            if content2.strip():
-                return content2
+            return ""
         return content
 
-    def formal_check(current_candidate, current_candidate_num):
-        if lean_mode == "off":
-            return True, "Formal verification disabled by --lean-mode off.", None, None
+    def draft_formal_statement(
+        current_candidate,
+        current_candidate_num,
+        attempt,
+    ):
+        candidate_key = sha256_text(current_candidate)
+        label = f"CANDIDATE {current_candidate_num:02d}"
+        log_progress(
+            run_dir,
+            f"RUN {outer_run} {label} LEAN_STATEMENT "
+            f"attempt {attempt}: start",
+        )
+        save_state(run_dir, {
+            "outer_run": outer_run,
+            "candidate_sha256": candidate_key,
+            "statement_attempt": attempt,
+            "consecutive_passes": len(pass_artifacts),
+            "error_count": error_count,
+            "accepted": False,
+            "status": "drafting_formal_statement",
+        })
+        proposed = call(
+            build_lean_statement_messages(problem),
+            f"{label} LEAN_STATEMENT",
+            max_tokens=LEAN_MAX_TOKENS,
+            thinking_budget=LEAN_THINKING_BUDGET,
+        )
+        proposed, violations = validate_lean_statement_prefix(proposed)
+        source_name = (
+            f"candidate_{current_candidate_num:02d}"
+            f"_statement_attempt_{attempt:02d}.lean"
+        )
+        save_text(subdir, source_name, proposed)
+        if violations:
+            report = "Statement policy failure:\n" + "\n".join(
+                f"- {item}" for item in violations
+            )
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} {label} LEAN_STATEMENT: "
+                "invalid prefix",
+            )
+            save_text(
+                subdir,
+                f"lean_statement_{current_candidate_num:02d}"
+                f"_attempt_{attempt:02d}.txt",
+                report,
+            )
+            return None, None, report
+        statement_hash = sha256_text(proposed)
+        report = (
+            f"Candidate SHA-256: {candidate_key}" + DNL
+            + f"Proposed statement SHA-256: {statement_hash}" + DNL
+            + "This statement has not yet been proved or frozen." + DNL
+            + DIV + "### Proposed Lean Statement ###" + DNL + proposed
+        )
+        save_text(
+            subdir,
+            f"lean_statement_{current_candidate_num:02d}"
+            f"_attempt_{attempt:02d}.txt",
+            report,
+        )
+        return proposed, statement_hash, report
 
-        cache_key = sha256_text(current_candidate)
+    def formal_check(
+        current_candidate,
+        current_candidate_num,
+        frozen_statement,
+        frozen_statement_hash,
+        attempt,
+    ):
+        if lean_mode == "off":
+            return (
+                True,
+                "Formal verification disabled by --lean-mode off.",
+                None,
+                None,
+                None,
+            )
+
+        candidate_key = sha256_text(current_candidate)
+        cache_key = (candidate_key, frozen_statement_hash)
         if cache_key in formal_cache:
             return formal_cache[cache_key]
 
         label = f"CANDIDATE {current_candidate_num:02d}"
-        log_progress(run_dir, f"RUN {outer_run} {label} LEAN_FORMALIZE: start")
+        log_progress(
+            run_dir,
+            f"RUN {outer_run} {label} LEAN_FORMALIZE "
+            f"attempt {attempt}: start",
+        )
+        save_state(run_dir, {
+            "outer_run": outer_run,
+            "candidate_sha256": candidate_key,
+            "formal_statement_sha256": frozen_statement_hash,
+            "formal_attempt": attempt,
+            "consecutive_passes": len(pass_artifacts),
+            "error_count": error_count,
+            "accepted": False,
+            "status": "formalizing",
+        })
         source = call(
-            build_lean_formalization_messages(problem, current_candidate),
+            build_lean_formalization_messages(
+                problem,
+                current_candidate,
+                frozen_statement,
+            ),
             f"{label} LEAN_FORMALIZE",
             max_tokens=LEAN_MAX_TOKENS,
             thinking_budget=LEAN_THINKING_BUDGET,
         )
-        source_name = f"candidate_{current_candidate_num:02d}.lean"
+        source_name = (
+            f"candidate_{current_candidate_num:02d}"
+            f"_formal_{attempt:02d}.lean"
+        )
         source_path = subdir / source_name
 
         def check_backends(lean_source, lean_source_path):
+            if not lean_source_preserves_frozen_statement(
+                lean_source,
+                frozen_statement,
+            ):
+                save_text(
+                    subdir,
+                    lean_source_path.name,
+                    strip_code_fences(lean_source),
+                )
+                return (
+                    False,
+                    False,
+                    None,
+                    "Frozen statement mismatch: generated Lean source changed "
+                    "the reviewed theorem prefix and was not executed.",
+                    None,
+                )
             local_ok, local_report = execute_lean_code(
                 lean_source, lean_source_path, lean_project, timeout=LEAN_TIMEOUT
             )
@@ -1059,6 +2185,13 @@ def run_outer(
                     lean_source, axle_environment, timeout=LEAN_TIMEOUT
                 )
             passed = formal_backends_pass(local_ok, axle_ok, axle_mode)
+            statement_match = re.search(
+                r"Statement SHA-256: ([0-9a-f]{64})",
+                local_report,
+            )
+            statement_hash = (
+                statement_match.group(1) if statement_match else None
+            )
             combined_report = (
                 f"Local Lean: {'PASS' if local_ok else 'FAIL'}" + DNL
                 + local_report + DNL + DIV
@@ -1070,34 +2203,60 @@ def run_outer(
                 )
                 + DNL + axle_report
             )
-            return passed, local_ok, axle_ok, combined_report
+            return (
+                passed,
+                local_ok,
+                axle_ok,
+                combined_report,
+                statement_hash,
+            )
 
-        passed, local_ok, axle_ok, report = check_backends(source, source_path)
+        passed, local_ok, axle_ok, report, statement_hash = check_backends(
+            source, source_path
+        )
 
-        if not passed and LEAN_MAX_REPAIRS:
+        if not passed and LEAN_MAX_REPAIRS and not local_ok:
             log_progress(run_dir, f"RUN {outer_run} {label} LEAN_REPAIR: start")
             source = call(
                 build_lean_repair_messages(
-                    problem, current_candidate, source, report
+                    problem,
+                    current_candidate,
+                    frozen_statement,
+                    source,
+                    report,
                 ),
                 f"{label} LEAN_REPAIR",
                 max_tokens=LEAN_MAX_TOKENS,
                 thinking_budget=LEAN_THINKING_BUDGET,
             )
-            source_name = f"candidate_{current_candidate_num:02d}_lean_retry.lean"
-            source_path = subdir / source_name
-            passed, local_ok, axle_ok, report = check_backends(
-                source, source_path
+            source_name = (
+                f"candidate_{current_candidate_num:02d}"
+                f"_formal_{attempt:02d}_repair.lean"
             )
+            source_path = subdir / source_name
+            (
+                passed,
+                local_ok,
+                axle_ok,
+                report,
+                statement_hash,
+            ) = check_backends(source, source_path)
 
         status = "PASS" if passed else "FAIL"
         report = (
             f"Formal verification: {status} "
             f"(local Lean with AXLE mode {axle_mode})." + DNL
+            + f"Candidate SHA-256: {candidate_key}" + DNL
+            + f"Frozen statement SHA-256: {frozen_statement_hash}" + DNL
+            + f"Elaborated statement SHA-256: "
+            + (statement_hash or "unavailable") + DNL
             + report + DNL + DIV + "### Lean Source ###" + DNL
             + strip_code_fences(source)
         )
-        report_name = f"lean_verify_{current_candidate_num:02d}.txt"
+        report_name = (
+            f"lean_verify_{current_candidate_num:02d}"
+            f"_attempt_{attempt:02d}.txt"
+        )
         save_text(subdir, report_name, report)
         log_progress(
             run_dir,
@@ -1105,172 +2264,264 @@ def run_outer(
             f"(local={'PASS' if local_ok else 'FAIL'}, "
             f"axle={'SKIP' if axle_ok is None else ('PASS' if axle_ok else 'FAIL')})",
         )
-        result = (passed, report, source_name, report_name)
-        formal_cache[cache_key] = result
+        result = (
+            passed,
+            report,
+            source_name,
+            report_name,
+            statement_hash,
+        )
+        if passed:
+            formal_cache[cache_key] = result
         return result
 
-    # -- SOLVE --
     log_progress(run_dir, f"RUN {outer_run} SOLVE: start")
+    save_state(run_dir, {
+        "outer_run": outer_run,
+        "accepted": False,
+        "status": "solving",
+    })
     pivot_hint = build_pivot_hint(prev_failure_reason) if outer_run > 1 else None
-    solution = call(build_solver_messages(problem, outer_run, pivot_hint, empirical_results, failure_context), "SOLVE")
+    solver_messages = build_solver_messages(
+        problem,
+        outer_run,
+        pivot_hint,
+        empirical_results,
+        failure_context,
+    )
+    solution = call(solver_messages, "SOLVE")
     save_text(subdir, "draft.md", solution)
 
-    # -- SELF-IMPROVE --
-    log_progress(run_dir, f"RUN {outer_run} SELF_IMPROVE: start")
-    solution = call(
-        build_self_improvement_messages(problem, solution), "SELF_IMPROVE"
+    should_self_improve = self_improve_mode == "always" or (
+        self_improve_mode == "recovery"
+        and not candidate_is_complete(solution)
     )
-    save_text(subdir, "candidate_00.md", solution)
-    candidate = solution
-
-    # -- Initial LEAN_VERIFY + VERIFY + CLASSIFY --
-    formal_ok, formal_report, lean_source_name, lean_report_name = formal_check(
-        candidate, candidate_num
-    )
-    log_progress(run_dir, f"RUN {outer_run} VERIFY: initial")
-    verification = call(
-        build_verifier_messages(problem, candidate, formal_report), "VERIFY"
-    )
-    if formal_gate_required and not formal_ok:
-        verification += (
-            DNL + DIV + "### Required Formal Verification Gate Failure ###" + DNL
-            + "The candidate cannot be accepted until the configured formal "
-            + "verification backends verify a faithful formalization of the "
-            + "full problem." + DNL
-            + formal_report
+    if should_self_improve:
+        log_progress(run_dir, f"RUN {outer_run} SELF_IMPROVE: recovery start")
+        save_state(run_dir, {
+            "outer_run": outer_run,
+            "accepted": False,
+            "status": "self_improving",
+        })
+        improved = call(
+            build_self_improvement_messages(
+                solver_messages,
+                solution,
+                recovery=self_improve_mode == "recovery",
+            ),
+            "SELF_IMPROVE",
         )
-    save_text(subdir, f"verify_{verify_num:02d}.md", verification)
-
-    log_progress(run_dir, f"RUN {outer_run} CLASSIFY: initial")
-    classification = call(build_classifier_messages(verification), "CLASSIFY")
-    if formal_gate_required and not formal_ok and is_standalone_yes(classification):
-        classification = "no"
+        if improved.strip():
+            solution = improved
+    else:
         log_progress(
             run_dir,
-            f"RUN {outer_run} CLASSIFY: overridden to no by required formal gate",
+            f"RUN {outer_run} SELF_IMPROVE: skipped ({self_improve_mode})",
         )
-    save_text(subdir, f"classify_{verify_num:02d}.md", classification)
-    verify_num += 1
-
-    good_verify = classification
+    save_text(subdir, "candidate_00.md", solution)
+    candidate = solution
+    candidate_hash = sha256_text(candidate)
+    profile_index = 0
     error_count = 0
-    correct_count = 1 if is_standalone_yes(good_verify) else 0
-    consecutive_no = 0
-    last_good_candidate = candidate if correct_count > 0 else None
     last_failure_reason = None
-    all_failure_reasons = []  # Gap 2: accumulate all failure reasons
-    error_locations_history = []  # Core Fix B: track error locations across iterations
+    all_failure_reasons = []
+    formal_ok = lean_mode == "off"
+    formal_report = None
+    lean_source_name = None
+    lean_report_name = None
+    proposed_statement = None
+    proposed_statement_hash = None
+    frozen_statement = None
+    formal_statement_hash = None
+    elaborated_statement_hash = None
+    statement_attempt = 0
+    formal_attempt = 0
+    computational_report = ""
+    save_state(run_dir, {
+        "outer_run": outer_run,
+        "candidate_sha256": candidate_hash,
+        "consecutive_passes": 0,
+        "error_count": 0,
+        "accepted": False,
+        "status": "cas_verifying",
+    })
+    cas_ok, computational_report = cas_verify_candidate(
+        candidate,
+        api_url,
+        api_key,
+        model,
+        run_dir,
+        outer_run,
+        0,
+        usage_ledger=usage_ledger,
+        validation_enabled=validation_enabled,
+    )
+    if not cas_ok:
+        computational_report = "CAS verification failed:\n" + computational_report
 
-    if is_standalone_yes(good_verify):
-        pass_artifacts.append({
-            "candidate": f"candidate_{candidate_num:02d}.md",
-            "verify": f"verify_{verify_num - 1:02d}.md",
-            "classify": f"classify_{verify_num - 1:02d}.md",
-            "lean_source": lean_source_name,
-            "lean_report": lean_report_name,
-        })
-        log_progress(run_dir, f"RUN {outer_run} initial PASS (1/{REQUIRED_PASSES})")
-    elif is_standalone_improve(good_verify):
-        log_progress(run_dir, f"RUN {outer_run} initial IMPROVE (minor gaps)")
-    else:
-        consecutive_no = 1
-        last_failure_reason = extract_failure_reason(verification)
-        all_failure_reasons.append(last_failure_reason)
-        log_progress(run_dir, f"RUN {outer_run} initial FAIL (errors=0)")
-
-    # -- REFINE / CORRECT / VERIFY / CLASSIFY loop --
     for i in range(MAX_ITERATIONS):
         save_state(run_dir, {
             "outer_run": outer_run,
             "iteration": i + 1,
-            "consecutive_passes": correct_count,
+            "candidate_sha256": candidate_hash,
+            "verification_profile": VERIFICATION_PROFILES[
+                profile_index
+            ][0],
+            "consecutive_passes": len(pass_artifacts),
             "error_count": error_count,
+            "total_tokens": usage_ledger.total_tokens,
             "accepted": False,
             "status": "running",
         })
 
-        # Decide action based on previous classification
-        if is_standalone_yes(good_verify):
-            # Pass - re-verify same candidate (no modification)
-            pass
-        elif is_standalone_improve(good_verify):
-            # Improve - non-destructive refinement to close minor gaps
-            log_progress(
-                run_dir,
-                f"RUN {outer_run} ITER {i+1} REFINE: start (closing minor gaps)",
+        if (
+            profile_index == 1
+            and lean_mode != "off"
+            and proposed_statement is None
+        ):
+            statement_attempt += 1
+            (
+                proposed_statement,
+                proposed_statement_hash,
+                _statement_report,
+            ) = draft_formal_statement(
+                candidate,
+                candidate_num,
+                statement_attempt,
             )
-            candidate = call(
-                build_refinement_messages(problem, candidate, verification),
-                f"ITER {i+1} REFINE",
-                max_tokens=CORRECT_MAX_TOKENS,
-                thinking_budget=CORRECT_THINKING_BUDGET,
+            if proposed_statement is None:
+                if statement_attempt < FORMAL_MAX_ATTEMPTS:
+                    continue
+                save_state(run_dir, {
+                    "outer_run": outer_run,
+                    "iteration": i + 1,
+                    "candidate_sha256": candidate_hash,
+                    "consecutive_passes": len(pass_artifacts),
+                    "error_count": error_count,
+                    "accepted": False,
+                    "status": "formal_statement_failed",
+                })
+                return False, None, {
+                    "total_tokens": usage_ledger.total_tokens,
+                    "failure_reason": (
+                        "The model could not produce a structurally valid "
+                        "Lean theorem statement for fidelity review."
+                    ),
+                    "candidate_sha256": candidate_hash,
+                }
+
+        if (
+            profile_index == 2
+            and lean_mode != "off"
+            and formal_report is None
+        ):
+            if not frozen_statement or not formal_statement_hash:
+                raise AssertionError(
+                    "formal proof requested before statement freeze"
+                )
+            formal_attempt += 1
+            (
+                formal_ok,
+                formal_report,
+                lean_source_name,
+                lean_report_name,
+                elaborated_statement_hash,
+            ) = formal_check(
+                candidate,
+                candidate_num,
+                frozen_statement,
+                formal_statement_hash,
+                formal_attempt,
             )
-            candidate_num += 1
-            save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
-        else:
-            # No - check tolerance before destructive correction
-            if correct_count > 0 and consecutive_no == 1:
-                # Tolerance: first no after passes, re-verify before correcting
+            if not formal_ok and formal_gate_required:
+                if formal_attempt < FORMAL_MAX_ATTEMPTS:
+                    log_progress(
+                        run_dir,
+                        f"RUN {outer_run} CANDIDATE {candidate_num:02d}: "
+                        "formalization failed; retrying without changing "
+                        "the informal proof",
+                    )
+                    save_state(run_dir, {
+                        "outer_run": outer_run,
+                        "iteration": i + 1,
+                        "candidate_sha256": candidate_hash,
+                        "verification_profile": VERIFICATION_PROFILES[
+                            profile_index
+                        ][0],
+                        "consecutive_passes": len(pass_artifacts),
+                        "error_count": error_count,
+                        "accepted": False,
+                        "status": "formal_retry",
+                    })
+                    formal_report = None
+                    elaborated_statement_hash = None
+                    continue
                 log_progress(
                     run_dir,
-                    f"RUN {outer_run} ITER {i+1} TOLERANCE: re-verifying (passes={correct_count})",
+                    f"RUN {outer_run} CANDIDATE {candidate_num:02d}: "
+                    "formalization attempts exhausted",
                 )
-            else:
-                # Destructive correction with fallback to last good candidate
-                correct_count = 0
-                error_count += 1
-                pass_artifacts.clear()
-                base = last_good_candidate if last_good_candidate else candidate
-                log_progress(
-                    run_dir,
-                    f"RUN {outer_run} ITER {i+1} CORRECT: start (errors={error_count})",
-                )
-                candidate = call(
-                    build_correction_messages(problem, base, verification),
-                    f"ITER {i+1} CORRECT",
-                    max_tokens=CORRECT_MAX_TOKENS,
-                    thinking_budget=CORRECT_THINKING_BUDGET,
-                )
-                candidate_num += 1
-                save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
+                save_state(run_dir, {
+                    "outer_run": outer_run,
+                    "iteration": i + 1,
+                    "candidate_sha256": candidate_hash,
+                    "consecutive_passes": len(pass_artifacts),
+                    "error_count": error_count,
+                    "accepted": False,
+                    "status": "formal_failed",
+                })
+                return False, None, {
+                    "total_tokens": usage_ledger.total_tokens,
+                    "failure_reason": (
+                        "The informal candidate passed an audit but could not "
+                        "be formalized after isolated formalization retries."
+                    ),
+                    "candidate_sha256": candidate_hash,
+                }
 
-                # Core Fix D: CAS self-verification after CORRECT
-                cas_pass, cas_details = cas_verify_candidate(
-                    candidate, api_url, api_key, model, run_dir, outer_run, i + 1
-                )
-                if not cas_pass and CAS_MAX_RETRIES > 0:
-                    log_progress(run_dir, f"RUN {outer_run} ITER {i+1} CAS_RETRY: retrying CORRECT with CAS feedback")
-                    candidate = call(
-                        build_correction_messages(problem, base, verification, cas_feedback=cas_details),
-                        f"ITER {i+1} CAS_RETRY",
-                        max_tokens=CORRECT_MAX_TOKENS,
-                        thinking_budget=CORRECT_THINKING_BUDGET,
-                    )
-                    candidate_num += 1
-                    save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
-
-                # Fix 2: CAS_COMPUTE — try to close computational identity gaps
-                # When previous verification had only Justification Gaps (no Critical Errors),
-                # attempt direct CAS verification of the incomplete identity
-                if "Justification Gap" in verification and "Critical Error" not in verification:
-                    augmented = cas_compute_gap(
-                        candidate, verification, api_url, api_key, model, run_dir, outer_run, i + 1
-                    )
-                    if augmented:
-                        candidate = augmented
-                        candidate_num += 1
-                        save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
-
-        # LEAN_VERIFY + VERIFY
-        formal_ok, formal_report, lean_source_name, lean_report_name = formal_check(
-            candidate, candidate_num
+        profile_name, profile_instruction = VERIFICATION_PROFILES[
+            profile_index
+        ]
+        log_progress(
+            run_dir,
+            f"RUN {outer_run} ITER {i+1} VERIFY "
+            f"profile={profile_name}: start",
         )
-        log_progress(run_dir, f"RUN {outer_run} ITER {i+1} VERIFY: start")
+        save_state(run_dir, {
+            "outer_run": outer_run,
+            "iteration": i + 1,
+            "candidate_sha256": candidate_hash,
+            "verification_profile": profile_name,
+            "consecutive_passes": len(pass_artifacts),
+            "error_count": error_count,
+            "accepted": False,
+            "status": "verifying",
+        })
         verification = call(
-            build_verifier_messages(problem, candidate, formal_report),
-            f"ITER {i+1} VERIFY",
+            build_verifier_messages(
+                problem,
+                candidate,
+                (
+                    formal_report
+                    if profile_name == "computation"
+                    else None
+                ),
+                (
+                    computational_report
+                    if profile_name == "computation"
+                    else None
+                ),
+                profile_instruction,
+                proposed_formal_statement=(
+                    proposed_statement
+                    if profile_name == "statement_fidelity"
+                    else None
+                ),
+            ),
+            f"VERIFY {profile_name}",
         )
-        if formal_gate_required and not formal_ok:
+        formal_expected = profile_index == 2 and lean_mode != "off"
+        if formal_gate_required and formal_expected and not formal_ok:
             verification += (
                 DNL + DIV + "### Required Formal Verification Gate Failure ###" + DNL
                 + "The candidate cannot be accepted until the configured formal "
@@ -1279,121 +2530,334 @@ def run_outer(
                 + formal_report
             )
         save_text(subdir, f"verify_{verify_num:02d}.md", verification)
-
-        # Core Fix B: Track error locations for structural error detection
-        current_error_locations = extract_error_locations(verification)
-
-        # CLASSIFY
-        log_progress(run_dir, f"RUN {outer_run} ITER {i+1} CLASSIFY: start")
-        classification = call(
-            build_classifier_messages(verification),
-            f"ITER {i+1} CLASSIFY",
-        )
-        if formal_gate_required and not formal_ok and is_standalone_yes(classification):
-            classification = "no"
+        verdict = parse_verdict(verification)
+        if (
+            formal_gate_required
+            and formal_expected
+            and not formal_ok
+            and verdict == "yes"
+        ):
+            verdict = "no"
             log_progress(
                 run_dir,
-                f"RUN {outer_run} ITER {i+1} CLASSIFY: overridden to no by required formal gate",
+                f"RUN {outer_run} ITER {i+1}: verdict overridden by "
+                "required formal gate",
             )
-        save_text(subdir, f"classify_{verify_num:02d}.md", classification)
+        save_text(subdir, f"classify_{verify_num:02d}.md", verdict)
+        audit_statement_hash = formal_statement_hash
+        if (
+            profile_name == "statement_fidelity"
+            and lean_mode != "off"
+        ):
+            audit_statement_hash = proposed_statement_hash
+        metadata_name = f"verify_{verify_num:02d}.json"
+        save_text(
+            subdir,
+            metadata_name,
+            json.dumps(
+                {
+                    "candidate_sha256": candidate_hash,
+                    "profile": profile_name,
+                    "verdict": verdict,
+                    "formal_statement_sha256": audit_statement_hash,
+                    "elaborated_statement_sha256": (
+                        elaborated_statement_hash
+                    ),
+                },
+                indent=2,
+            ),
+        )
         verify_num += 1
 
-        good_verify = classification
-
-        # Update counters based on new classification
-        if is_standalone_yes(good_verify):
-            correct_count += 1
+        if verdict == "yes":
             error_count = 0
-            consecutive_no = 0
-            last_good_candidate = candidate
-            pass_artifacts.append({
-                "candidate": f"candidate_{candidate_num:02d}.md",
-                "verify": f"verify_{verify_num - 1:02d}.md",
-                "classify": f"classify_{verify_num - 1:02d}.md",
-                "lean_source": lean_source_name,
-                "lean_report": lean_report_name,
-            })
-            log_progress(
-                run_dir,
-                f"RUN {outer_run} ITER {i+1} PASS ({correct_count}/{REQUIRED_PASSES})",
-            )
-        elif is_standalone_improve(good_verify):
-            error_count = 0
-            consecutive_no = 0
-            log_progress(
-                run_dir,
-                f"RUN {outer_run} ITER {i+1} IMPROVE ({correct_count}/{REQUIRED_PASSES})",
-            )
-        else:
-            consecutive_no += 1
-            last_failure_reason = extract_failure_reason(verification)
-            all_failure_reasons.append(last_failure_reason)
-            log_progress(
-                run_dir,
-                f"RUN {outer_run} ITER {i+1} FAIL "
-                f"(passes={correct_count} errors={error_count})",
-            )
-
-            # Core Fix B: Structural error detection
-            is_structural, structural_reason = detect_structural_error(
-                current_error_locations, error_locations_history
-            )
-            error_locations_history.append(current_error_locations)
-            if is_structural:
+            if (
+                profile_name == "statement_fidelity"
+                and lean_mode != "off"
+            ):
+                if not proposed_statement or not proposed_statement_hash:
+                    raise AssertionError(
+                        "statement fidelity passed without a proposed statement"
+                    )
+                frozen_statement = proposed_statement
+                formal_statement_hash = proposed_statement_hash
+                frozen_name = (
+                    f"candidate_{candidate_num:02d}_statement_frozen.lean"
+                )
+                save_text(subdir, frozen_name, frozen_statement)
+                for artifact in pass_artifacts:
+                    artifact["formal_statement_sha256"] = (
+                        formal_statement_hash
+                    )
+                    metadata_path = subdir / artifact["metadata"]
+                    metadata = json.loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                    metadata["formal_statement_sha256"] = (
+                        formal_statement_hash
+                    )
+                    save_atomic_text(
+                        metadata_path,
+                        json.dumps(metadata, indent=2),
+                    )
                 log_progress(
                     run_dir,
-                    f"RUN {outer_run} ITER {i+1} STRUCTURAL_ERROR: {structural_reason}",
+                    f"RUN {outer_run} CANDIDATE {candidate_num:02d} "
+                    f"LEAN_STATEMENT FROZEN: "
+                    f"{formal_statement_hash[:16]}...",
                 )
-                combined_reason = " | ".join(all_failure_reasons[-3:]) if all_failure_reasons else last_failure_reason
-                combined_reason += f" | STRUCTURAL: {structural_reason}"
+            pass_artifacts.append({
+                "candidate": f"candidate_{candidate_num:02d}.md",
+                "candidate_sha256": candidate_hash,
+                "profile": profile_name,
+                "verify": f"verify_{verify_num - 1:02d}.md",
+                "classify": f"classify_{verify_num - 1:02d}.md",
+                "metadata": metadata_name,
+                "lean_source": lean_source_name,
+                "lean_report": lean_report_name,
+                "formal_statement_sha256": (
+                    formal_statement_hash
+                    if lean_mode != "off"
+                    else None
+                ),
+                "elaborated_statement_sha256": (
+                    elaborated_statement_hash
+                ),
+            })
+            if any(
+                artifact["candidate_sha256"] != candidate_hash
+                for artifact in pass_artifacts
+            ):
+                raise AssertionError(
+                    "pass artifacts span multiple candidate hashes"
+                )
+            profile_index += 1
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} ITER {i+1} PASS "
+                f"profile={profile_name} "
+                f"({len(pass_artifacts)}/{REQUIRED_PASSES})",
+            )
+            save_state(run_dir, {
+                "outer_run": outer_run,
+                "iteration": i + 1,
+                "candidate_sha256": candidate_hash,
+                "verification_profile": profile_name,
+                "consecutive_passes": len(pass_artifacts),
+                "error_count": error_count,
+                "accepted": False,
+                "status": "profile_passed",
+            })
+            if len(pass_artifacts) >= REQUIRED_PASSES:
+                if formal_gate_required and not formal_ok:
+                    raise AssertionError(
+                        "formal gate was not satisfied at acceptance"
+                    )
+                if lean_mode != "off":
+                    if not formal_statement_hash:
+                        raise AssertionError(
+                            "accepted candidate has no frozen statement hash"
+                        )
+                    if any(
+                        artifact["formal_statement_sha256"]
+                        != formal_statement_hash
+                        for artifact in pass_artifacts
+                    ):
+                        raise AssertionError(
+                            "pass artifacts span multiple formal statements"
+                        )
+                log_progress(
+                    run_dir,
+                    f"RUN {outer_run} VERIFIED: {REQUIRED_PASSES} "
+                    "distinct audits of one candidate hash",
+                )
                 save_state(run_dir, {
                     "outer_run": outer_run,
                     "iteration": i + 1,
-                    "consecutive_passes": correct_count,
+                    "candidate_sha256": candidate_hash,
+                    "consecutive_passes": len(pass_artifacts),
                     "error_count": error_count,
                     "accepted": False,
-                    "status": "structural_error",
+                    "status": "verified",
                 })
-                return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
+                return True, candidate, {
+                    "total_tokens": usage_ledger.total_tokens,
+                    "pass_artifacts": pass_artifacts,
+                    "iterations": i + 1,
+                    "failure_reason": last_failure_reason,
+                    "candidate_sha256": candidate_hash,
+                    "formal_statement_sha256": formal_statement_hash,
+                    "elaborated_statement_sha256": (
+                        elaborated_statement_hash
+                    ),
+                }
+            continue
 
-        # Check thresholds
-        if correct_count >= REQUIRED_PASSES and (
-            not formal_gate_required or formal_ok
+        if (
+            profile_name == "statement_fidelity"
+            and lean_mode != "off"
         ):
+            last_failure_reason = extract_failure_reason(verification)
+            proposed_statement = None
+            proposed_statement_hash = None
             log_progress(
                 run_dir,
-                f"RUN {outer_run} ACCEPTED: {REQUIRED_PASSES} consecutive passes",
+                f"RUN {outer_run} ITER {i+1} LEAN_STATEMENT: "
+                f"fidelity verdict={verdict}; redrafting without changing "
+                "the informal candidate",
             )
+            if statement_attempt < FORMAL_MAX_ATTEMPTS:
+                save_state(run_dir, {
+                    "outer_run": outer_run,
+                    "iteration": i + 1,
+                    "candidate_sha256": candidate_hash,
+                    "verification_profile": profile_name,
+                    "verdict": verdict,
+                    "statement_attempt": statement_attempt,
+                    "consecutive_passes": len(pass_artifacts),
+                    "error_count": error_count,
+                    "accepted": False,
+                    "status": "formal_statement_retry",
+                })
+                continue
             save_state(run_dir, {
                 "outer_run": outer_run,
                 "iteration": i + 1,
-                "consecutive_passes": correct_count,
-                "error_count": error_count,
-                "accepted": True,
-                "status": "accepted",
-            })
-            return True, candidate, {
-                "total_tokens": total_tokens,
-                "pass_artifacts": pass_artifacts,
-                "iterations": i + 1,
-                "failure_reason": last_failure_reason,
-            }
-
-        if error_count >= MAX_ERRORS:
-            log_progress(
-                run_dir,
-                f"RUN {outer_run} FAILED: {MAX_ERRORS} errors reached",
-            )
-            save_state(run_dir, {
-                "outer_run": outer_run,
-                "iteration": i + 1,
-                "consecutive_passes": correct_count,
+                "candidate_sha256": candidate_hash,
+                "verification_profile": profile_name,
+                "verdict": verdict,
+                "statement_attempt": statement_attempt,
+                "consecutive_passes": len(pass_artifacts),
                 "error_count": error_count,
                 "accepted": False,
-                "status": "failed",
+                "status": "formal_statement_failed",
             })
-            combined_reason = " | ".join(all_failure_reasons[-3:]) if all_failure_reasons else last_failure_reason
-            return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
+            return False, None, {
+                "total_tokens": usage_ledger.total_tokens,
+                "failure_reason": (
+                    "The informal candidate passed the proof-logic audit, "
+                    "but no faithful Lean theorem statement was approved "
+                    "within the isolated statement-drafting attempts."
+                ),
+                "candidate_sha256": candidate_hash,
+            }
+
+        last_failure_reason = extract_failure_reason(verification)
+        all_failure_reasons.append(last_failure_reason)
+        pass_artifacts.clear()
+        profile_index = 0
+        if verdict == "improve":
+            error_count = 0
+            next_status = "refining"
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} ITER {i+1} REFINE: "
+                "pass streak reset before mutation",
+            )
+        else:
+            error_count += 1
+            next_status = "correcting"
+            log_progress(
+                run_dir,
+                f"RUN {outer_run} ITER {i+1} CORRECT: "
+                f"errors={error_count}, pass streak reset",
+            )
+        save_state(run_dir, {
+            "outer_run": outer_run,
+            "iteration": i + 1,
+            "candidate_sha256": candidate_hash,
+            "verification_profile": profile_name,
+            "verdict": verdict,
+            "consecutive_passes": 0,
+            "error_count": error_count,
+            "accepted": False,
+            "status": next_status,
+        })
+        if verdict == "no" and error_count >= MAX_ERRORS:
+            combined_reason = " | ".join(all_failure_reasons[-3:])
+            return False, None, {
+                "total_tokens": usage_ledger.total_tokens,
+                "failure_reason": combined_reason,
+            }
+
+        evidence = cas_compute_gap(
+            candidate,
+            verification,
+            api_url,
+            api_key,
+            model,
+            run_dir,
+            outer_run,
+            i + 1,
+            usage_ledger=usage_ledger,
+            validation_enabled=validation_enabled,
+        )
+        combined_evidence = "\n\n".join(
+            item for item in (computational_report, evidence) if item
+        )
+        if verdict == "improve":
+            candidate = call(
+                build_refinement_messages(
+                    problem,
+                    candidate,
+                    verification,
+                    combined_evidence,
+                ),
+                f"ITER {i+1} REFINE",
+                max_tokens=CORRECT_MAX_TOKENS,
+                thinking_budget=CORRECT_THINKING_BUDGET,
+            )
+        else:
+            candidate = call(
+                build_correction_messages(
+                    problem,
+                    candidate,
+                    verification,
+                    combined_evidence,
+                ),
+                f"ITER {i+1} CORRECT",
+                max_tokens=CORRECT_MAX_TOKENS,
+                thinking_budget=CORRECT_THINKING_BUDGET,
+            )
+
+        candidate_num += 1
+        save_text(subdir, f"candidate_{candidate_num:02d}.md", candidate)
+        candidate_hash = sha256_text(candidate)
+        save_state(run_dir, {
+            "outer_run": outer_run,
+            "iteration": i + 1,
+            "candidate_sha256": candidate_hash,
+            "consecutive_passes": 0,
+            "error_count": error_count,
+            "accepted": False,
+            "status": "cas_verifying",
+        })
+        formal_ok = lean_mode == "off"
+        formal_report = None
+        lean_source_name = None
+        lean_report_name = None
+        proposed_statement = None
+        proposed_statement_hash = None
+        frozen_statement = None
+        formal_statement_hash = None
+        elaborated_statement_hash = None
+        statement_attempt = 0
+        formal_attempt = 0
+        cas_ok, computational_report = cas_verify_candidate(
+            candidate,
+            api_url,
+            api_key,
+            model,
+            run_dir,
+            outer_run,
+            i + 1,
+            usage_ledger=usage_ledger,
+            validation_enabled=validation_enabled,
+        )
+        if not cas_ok:
+            computational_report = (
+                "CAS verification failed:\n" + computational_report
+            )
 
     log_progress(
         run_dir, f"RUN {outer_run} EXHAUSTED: {MAX_ITERATIONS} iterations"
@@ -1401,13 +2865,17 @@ def run_outer(
     save_state(run_dir, {
         "outer_run": outer_run,
         "iteration": MAX_ITERATIONS,
-        "consecutive_passes": correct_count,
+        "candidate_sha256": candidate_hash,
+        "consecutive_passes": len(pass_artifacts),
         "error_count": error_count,
         "accepted": False,
         "status": "exhausted",
     })
     combined_reason = " | ".join(all_failure_reasons[-3:]) if all_failure_reasons else last_failure_reason
-    return False, None, {"total_tokens": total_tokens, "failure_reason": combined_reason}
+    return False, None, {
+        "total_tokens": usage_ledger.total_tokens,
+        "failure_reason": combined_reason,
+    }
 
 
 # -- Main --
@@ -1421,10 +2889,32 @@ def main():
         "--api-url", default=os.getenv("IMO_SOLVER_API_URL", "")
     )
     parser.add_argument(
-        "--api-key", default=os.getenv("IMO_SOLVER_TOKEN", "")
+        "--api-key-file",
+        type=Path,
+        help=(
+            "Read the model API token from a mode-0600 file. Prefer the "
+            "IMO_SOLVER_TOKEN environment variable."
+        ),
     )
     parser.add_argument(
         "--model", default=os.getenv("IMO_SOLVER_MODEL", "")
+    )
+    parser.add_argument(
+        "--verifier-model",
+        default=os.getenv("IMO_VERIFIER_MODEL", ""),
+        help="Optional distinct model for the three verifier profiles.",
+    )
+    parser.add_argument(
+        "--self-improve",
+        choices=("recovery", "always", "off"),
+        default=os.getenv("IMO_SELF_IMPROVE", "recovery"),
+        help="Run SELF_IMPROVE only for incomplete SOLVE output by default.",
+    )
+    parser.add_argument(
+        "--validation-mode",
+        choices=("sandboxed", "off"),
+        default=os.getenv("IMO_VALIDATION_MODE", "sandboxed"),
+        help="Run empirical/CAS Python only inside the supported OS sandbox.",
     )
     parser.add_argument(
         "--lean-mode",
@@ -1458,8 +2948,17 @@ def main():
 
     if not args.api_url:
         parser.error("--api-url or IMO_SOLVER_API_URL is required")
-    if not args.api_key:
-        parser.error("--api-key or IMO_SOLVER_TOKEN is required")
+    api_key = os.getenv("IMO_SOLVER_TOKEN", "")
+    if args.api_key_file:
+        try:
+            mode = stat.S_IMODE(args.api_key_file.stat().st_mode)
+            if mode & 0o077:
+                parser.error("--api-key-file must have mode 0600")
+            api_key = args.api_key_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            parser.error(f"cannot read --api-key-file: {exc}")
+    if not api_key:
+        parser.error("IMO_SOLVER_TOKEN or --api-key-file is required")
     if not args.model:
         parser.error("--model or IMO_SOLVER_MODEL is required")
     if args.axle_mode != "off":
@@ -1474,6 +2973,14 @@ def main():
                 "AXLE client unavailable; install requirements-axle.txt"
             )
     args.lean_project = args.lean_project.resolve()
+    if (
+        args.validation_mode == "sandboxed"
+        and not shutil.which("sandbox-exec")
+    ):
+        parser.error(
+            "--validation-mode sandboxed requires sandbox-exec; use off "
+            "rather than executing generated Python unsandboxed"
+        )
     if args.lean_mode != "off":
         if not (args.lean_project / "lakefile.lean").is_file():
             parser.error(
@@ -1484,49 +2991,42 @@ def main():
             Path.home() / ".elan" / "bin" / "lake"
         ).is_file():
             parser.error("local Lean not installed; run scripts/setup_lean.sh")
+        if not shutil.which("sandbox-exec"):
+            parser.error(
+                "local Lean verification requires sandbox-exec on this host"
+            )
 
     problem = args.problem.read_text(encoding="utf-8")
     args.run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Pre-launch duplicate detection: check if another orchestrator is
-    # already running for the same output file.
-    lock_file = args.output.with_suffix(args.output.suffix + ".lock")
-    if lock_file.exists():
-        try:
-            old_pid = int(lock_file.read_text().strip())
-            try:
-                os.kill(old_pid, 0)
-                print(
-                    f"ERROR: Another orchestrator (PID {old_pid}) is already "
-                    f"running for {args.output}. Refusing to duplicate.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            except (ProcessLookupError, PermissionError):
-                pass  # PID is dead, take over the lock
-        except (ValueError, OSError):
-            pass  # Corrupt lock file, take over
-
-    lock_file.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        lock_file = acquire_output_lock(args.output)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    atexit.register(release_output_lock, lock_file)
 
     if (args.run_dir / "state.json").exists():
         print(
             f"ERROR: run directory already has state.json: {args.run_dir}",
             file=sys.stderr,
         )
-        lock_file.unlink(missing_ok=True)
+        release_output_lock(lock_file)
         sys.exit(1)
 
     log_progress(
         args.run_dir,
         f"ORCHESTRATOR START: problem={args.problem.name} model={args.model} "
+        f"verifier_model={args.verifier_model or args.model} "
+        f"self_improve={args.self_improve} "
+        f"validation_mode={args.validation_mode} "
         f"lean_mode={args.lean_mode} axle_mode={args.axle_mode} "
         f"axle_environment={args.axle_environment}",
     )
 
     last_failure_reason = None
     consecutive_infra_errors = 0
-    for outer_run in range(1, MAX_OUTER_RUNS + 1):
+    usage_ledger = UsageLedger(args.run_dir / "usage.jsonl")
+    outer_run = 1
+    while outer_run <= MAX_OUTER_RUNS:
         log_progress(args.run_dir, f"OUTER_RUN {outer_run}/{MAX_OUTER_RUNS}")
         save_state(args.run_dir, {
             "outer_run": outer_run,
@@ -1534,18 +3034,23 @@ def main():
         })
 
         try:
-            # Core Fix A: Pre-SOLVE empirical validation
             empirical_results = pre_solve_validation(
-                problem, args.api_url, args.api_key, args.model, args.run_dir, outer_run
+                problem,
+                args.api_url,
+                api_key,
+                args.model,
+                args.run_dir,
+                outer_run,
+                usage_ledger=usage_ledger,
+                validation_enabled=args.validation_mode == "sandboxed",
             )
-            # Core Fix C: Read failure ledger for cross-run knowledge
             failure_ledger = read_failure_ledger(args.run_dir)
             failure_context = build_failure_ledger_context(failure_ledger)
             accepted, candidate, summary = run_outer(
                 outer_run,
                 problem,
                 args.api_url,
-                args.api_key,
+                api_key,
                 args.model,
                 args.run_dir,
                 prev_failure_reason=last_failure_reason,
@@ -1555,15 +3060,21 @@ def main():
                 lean_project=args.lean_project,
                 axle_mode=args.axle_mode,
                 axle_environment=args.axle_environment,
+                self_improve_mode=args.self_improve,
+                validation_enabled=args.validation_mode == "sandboxed",
+                usage_ledger=usage_ledger,
+                verifier_model=args.verifier_model or None,
             )
             consecutive_infra_errors = 0
         except InfrastructureError as exc:
             consecutive_infra_errors += 1
-            backoff = INFRA_BACKOFF_BASE * (2 ** consecutive_infra_errors)
+            backoff = INFRA_BACKOFF_BASE * (
+                2 ** (consecutive_infra_errors - 1)
+            )
             log_progress(
                 args.run_dir,
                 f"RUN {outer_run} INFRA_ERROR ({consecutive_infra_errors}/{MAX_INFRA_RETRIES}): {exc}, "
-                f"waiting {backoff}s before next run",
+                f"waiting {backoff}s before retrying the same run",
             )
             save_state(args.run_dir, {
                 "outer_run": outer_run,
@@ -1580,15 +3091,24 @@ def main():
                     "outer_run": outer_run,
                     "status": "endpoint_unavailable",
                 })
-                lock_file.unlink(missing_ok=True)
+                release_output_lock(lock_file)
                 print(
                     f"Endpoint unavailable after {MAX_INFRA_RETRIES} consecutive errors.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
             time.sleep(backoff)
-            # Retry the same outer run instead of advancing
             continue
+        except ConfigurationError as exc:
+            log_progress(args.run_dir, f"CONFIGURATION_ERROR: {exc}")
+            save_state(args.run_dir, {
+                "outer_run": outer_run,
+                "status": "configuration_error",
+                "error": str(exc),
+            })
+            release_output_lock(lock_file)
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
         except Exception as exc:
             log_progress(args.run_dir, f"RUN {outer_run} ERROR: {exc}")
             traceback.print_exc()
@@ -1597,46 +3117,87 @@ def main():
                 "status": "error",
                 "error": str(exc),
             })
+            outer_run += 1
             continue
 
         if not accepted and summary and summary.get("failure_reason"):
             last_failure_reason = summary["failure_reason"]
-            # Core Fix C: Write to failure ledger for cross-run knowledge
             write_failure_ledger(args.run_dir, {
                 "run": outer_run,
                 "failure_reason": summary["failure_reason"],
-                "empirical_results": locals().get("empirical_results"),
+                "empirical_results": empirical_results,
             })
 
         if accepted:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(candidate, encoding="utf-8")
-
             manifest = {
                 "problem": str(args.problem),
                 "output": str(args.output),
                 "sha256": sha256_text(candidate),
                 "outer_run": outer_run,
-                "total_tokens": summary.get("total_tokens", 0),
+                "total_tokens": usage_ledger.total_tokens,
                 "pass_artifacts": summary.get("pass_artifacts", []),
+                "formal_statement_sha256": summary.get(
+                    "formal_statement_sha256"
+                ),
+                "elaborated_statement_sha256": summary.get(
+                    "elaborated_statement_sha256"
+                ),
                 "lean_mode": args.lean_mode,
                 "axle_mode": args.axle_mode,
                 "axle_environment": args.axle_environment,
+                "self_improve_mode": args.self_improve,
+                "validation_mode": args.validation_mode,
+                "solver_model": args.model,
+                "verifier_model": args.verifier_model or args.model,
+                "usage_ledger": "usage.jsonl",
                 "timestamp": now_utc(),
             }
-            (args.run_dir / "manifest.json").write_text(
-                json.dumps(manifest, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            try:
+                save_atomic_text(args.output, candidate)
+                save_atomic_text(
+                    args.run_dir / "manifest.json",
+                    json.dumps(manifest, indent=2, ensure_ascii=False),
+                )
+            except OSError as exc:
+                log_progress(
+                    args.run_dir,
+                    f"PERSISTENCE_ERROR: {exc}",
+                )
+                save_state(args.run_dir, {
+                    "outer_run": outer_run,
+                    "candidate_sha256": manifest["sha256"],
+                    "accepted": False,
+                    "status": "persistence_error",
+                    "error": str(exc),
+                })
+                print(
+                    f"Verified solution could not be persisted: {exc}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
+            save_state(args.run_dir, {
+                "outer_run": outer_run,
+                "candidate_sha256": manifest["sha256"],
+                "formal_statement_sha256": manifest[
+                    "formal_statement_sha256"
+                ],
+                "elaborated_statement_sha256": manifest[
+                    "elaborated_statement_sha256"
+                ],
+                "consecutive_passes": REQUIRED_PASSES,
+                "accepted": True,
+                "status": "accepted",
+            })
             log_progress(
                 args.run_dir,
                 f"ACCEPTED: output={args.output} "
                 f"sha256={manifest['sha256'][:16]}...",
             )
             print(f"Solution accepted: {args.output}")
-            lock_file.unlink(missing_ok=True)
+            release_output_lock(lock_file)
             sys.exit(0)
+        outer_run += 1
 
     log_progress(
         args.run_dir,
@@ -1650,7 +3211,7 @@ def main():
         f"No verified solution found after {MAX_OUTER_RUNS} runs.",
         file=sys.stderr,
     )
-    lock_file.unlink(missing_ok=True)
+    release_output_lock(lock_file)
     sys.exit(1)
 
 

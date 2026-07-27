@@ -17,6 +17,8 @@ from orchestrator import (
     execute_lean_code,
     formal_backends_pass,
     lean_policy_violations,
+    lean_source_preserves_frozen_statement,
+    validate_lean_statement_prefix,
 )
 
 
@@ -44,6 +46,42 @@ class LeanVerifierTests(unittest.TestCase):
                 REPO_ROOT / "lean",
             )
         self.assertTrue(passed, report)
+        self.assertRegex(report, r"Statement SHA-256: [0-9a-f]{64}")
+
+    def test_rejects_theorem_name_inside_string_literal(self):
+        code = (
+            "import Mathlib\n"
+            'def bait : String := "theorem imo_problem"\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            passed, report = execute_lean_code(
+                code,
+                Path(directory) / "bait.lean",
+                REPO_ROOT / "lean",
+            )
+        self.assertFalse(passed)
+        self.assertIn("missing theorem named imo_problem", report)
+
+    def test_rejects_generated_lean_command_execution(self):
+        code = (
+            "import Mathlib\n"
+            "run_cmd IO.println \"not allowed\"\n"
+            "theorem imo_problem : True := by trivial\n"
+        )
+        violations = lean_policy_violations(code)
+        self.assertIn(
+            "forbidden Lean feature: command execution",
+            violations,
+        )
+        tactic_violations = lean_policy_violations(
+            "import Mathlib\n"
+            "theorem imo_problem : True := by\n"
+            "  run_tac Lean.Elab.Tactic.closeMainGoalUsing `True.intro\n"
+        )
+        self.assertIn(
+            "forbidden Lean feature: tactic-time command execution",
+            tactic_violations,
+        )
 
     def test_axle_modes_have_explicit_acceptance_semantics(self):
         self.assertTrue(formal_backends_pass(True, None, "off"))
@@ -56,6 +94,11 @@ class LeanVerifierTests(unittest.TestCase):
 
     def test_formal_reports_use_backend_neutral_prompt_labels(self):
         report = "Local Lean: FAIL\nAXLE (fallback): PASS"
+        frozen_statement = (
+            "import Mathlib\n"
+            "set_option autoImplicit false\n"
+            "theorem imo_problem : True := by"
+        )
         verifier_prompt = build_verifier_messages(
             "Prove the problem.",
             "Detailed Solution\nA proof.",
@@ -64,14 +107,62 @@ class LeanVerifierTests(unittest.TestCase):
         repair_prompt = build_lean_repair_messages(
             "Prove the problem.",
             "A proof.",
+            frozen_statement,
             "theorem imo_problem : True := by trivial",
             report,
         )[1]["content"]
 
         self.assertIn("### Formal Verification Report ###", verifier_prompt)
         self.assertIn("### Formal Verification Report ###", repair_prompt)
+        self.assertIn("### Frozen Lean Statement Prefix ###", repair_prompt)
         self.assertIn("passes the configured formal", repair_prompt)
         self.assertNotIn("### Local Lean Report ###", repair_prompt)
+
+    def test_statement_prefix_is_freezeable_only_before_proof_body(self):
+        frozen_statement = (
+            "import Mathlib\n"
+            "set_option autoImplicit false\n"
+            "theorem imo_problem (n : Nat) : n = n := by"
+        )
+        source, violations = validate_lean_statement_prefix(
+            frozen_statement
+        )
+        self.assertEqual(source, frozen_statement)
+        self.assertEqual(violations, [])
+
+        _, violations = validate_lean_statement_prefix(
+            frozen_statement + "\n  rfl"
+        )
+        self.assertIn(
+            "statement must end exactly at `:= by`",
+            violations,
+        )
+
+    def test_proof_source_must_preserve_frozen_statement_token_boundary(self):
+        frozen_statement = (
+            "import Mathlib\n"
+            "set_option autoImplicit false\n"
+            "theorem imo_problem : True := by"
+        )
+        self.assertTrue(
+            lean_source_preserves_frozen_statement(
+                frozen_statement + "\n  trivial",
+                frozen_statement,
+            )
+        )
+        self.assertFalse(
+            lean_source_preserves_frozen_statement(
+                frozen_statement + "_contra\n  trivial",
+                frozen_statement,
+            )
+        )
+        self.assertFalse(
+            lean_source_preserves_frozen_statement(
+                frozen_statement.replace("True", "False")
+                + "\n  contradiction",
+                frozen_statement,
+            )
+        )
 
     def test_axle_rejects_failed_declarations_even_when_code_compiles(self):
         class FakeAxleClient:
@@ -114,14 +205,14 @@ class LeanVerifierTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"AXLE_API_KEY": "test-key"}),
         ):
             passed, report = execute_axle_check(
-                "def unrelated : Nat := 1",
+                "import Mathlib\ndef unrelated : Nat := 1",
                 "lean-4.28.0",
             )
             self.assertFalse(passed)
             self.assertIn("missing theorem named imo_problem", report)
 
             passed, report = execute_axle_check(
-                "theorem imo_problem : True := by trivial",
+                "import Mathlib\ntheorem imo_problem : True := by trivial",
                 "lean-4.28.0",
             )
             self.assertFalse(passed)
@@ -129,7 +220,7 @@ class LeanVerifierTests(unittest.TestCase):
 
             FakeAxleClient.failed_declarations = []
             passed, report = execute_axle_check(
-                "theorem imo_problem : True := by trivial",
+                "import Mathlib\ntheorem imo_problem : True := by trivial",
                 "lean-4.28.0",
             )
             self.assertTrue(passed, report)
@@ -137,7 +228,7 @@ class LeanVerifierTests(unittest.TestCase):
 
             FakeAxleClient.raise_error = True
             passed, report = execute_axle_check(
-                "theorem imo_problem : True := by trivial",
+                "import Mathlib\ntheorem imo_problem : True := by trivial",
                 "lean-4.28.0",
             )
             self.assertFalse(passed)
